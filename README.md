@@ -67,22 +67,30 @@ No new syntax. No async keywords. No learning curve.
 
 ## Project status
 
-⚠️ This project is currently in **Proof of Concept / early development**.
+⚠️ This project is currently in **Alpha** stage.
 
 **What works:**
-- Event-loop based runtime
-- Concurrent job execution
-- Process isolation
-- Laravel integration (tested with Laravel 12)
-- Security hardening (production-ready validation)
-- Graceful shutdown
+- ✅ Event-loop based runtime (ReactPHP)
+- ✅ Concurrent job execution
+- ✅ Process isolation (child process spawning)
+- ✅ Job class definitions (Laravel-compatible)
+- ✅ Security hardening (production-ready validation)
+- ✅ Graceful shutdown (signal handling)
+- ✅ Memory monitoring and timeout enforcement
 
-**What is coming:**
-- Artisan command (`php artisan kqueue:run`)
-- Queue driver adapter (pull from Redis/SQS/DB)
-- Job retries
-- Process pooling
-- Observability hooks
+**What's missing for production use:**
+- ❌ Artisan command (`php artisan kqueue:run`)
+- ❌ Queue driver adapter (cannot pull from Redis/SQS/DB)
+- ❌ Job retries and failed job handling
+- ❌ Unit test coverage
+- ❌ Configuration publishing
+- ❌ Process pooling
+- ❌ Observability hooks
+
+**Can I use this now?**
+- ✅ For testing the concept and understanding the architecture
+- ✅ For demos and proof-of-concept projects
+- ❌ NOT for production deployment (missing critical queue integration)
 
 ## Why not just run more workers?
 
@@ -98,25 +106,35 @@ KQueue aims to provide:
 
 ## Installation
 
-Not available yet.
+⚠️ **Alpha Software - Not Production Ready**
 
-This repository currently hosts the proof of concept and design direction.
+This package is available on Packagist for testing and evaluation purposes only.
 
-To run the POC:
+```bash
+composer require kqueue/kqueue:^0.1.0-alpha
+```
+
+**Note:** KQueue currently lacks critical features for production use (queue driver integration, Artisan commands, job retries). It's intended for:
+- Understanding the architecture
+- Testing the concept
+- Contributing to development
+
+### Running the Examples
 
 ```bash
 composer install
 php examples/demo.php
 ```
 
-See [docs/POC.md](docs/POC.md) for proof of concept results and [LARAVEL_TEST_RESULTS.md](LARAVEL_TEST_RESULTS.md) for Laravel integration tests.
+See [LARAVEL_TEST_RESULTS.md](LARAVEL_TEST_RESULTS.md) for Laravel integration tests and [SECURITY.md](SECURITY.md) for security documentation.
 
 ## Roadmap
 
-- **v0.1**: Laravel queue integration
-- **v0.2**: Timeouts and retries
-- **v0.3**: Process pool for isolated jobs
-- **v1.0**: Production-ready runtime
+- **v0.1.0-alpha** (current): Core runtime and execution strategies
+- **v0.2.0-alpha**: Artisan commands and queue driver adapter
+- **v0.3.0-beta**: Job retries, failed job handling, and test coverage
+- **v0.4.0-beta**: Process pooling and configuration system
+- **v1.0.0**: Production-ready runtime with full Laravel integration
 
 ## Design philosophy
 
