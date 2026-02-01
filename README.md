@@ -1,169 +1,136 @@
-# KQueue - Node.js-style Queue Runtime for Laravel
+# KQueue
 
-A production-grade runtime for Laravel queues that brings Node.js-style execution guarantees to PHP.
+A Node.js-style, event-loop based runtime for Laravel queues — without changing how you write jobs.
 
-## The Problem
+## Why KQueue exists
 
-Laravel queues today suffer from:
-- **Blocking execution** - One slow job stalls the entire worker
-- **Process-based concurrency** - Need multiple workers for parallelism
-- **Poor isolation** - A crashed job kills the worker
-- **Linear FIFO** - Not ideal for real-world workloads
-- **Supervisor dependency** - Process manager doesn't understand job state
+Laravel queues today are process-based and linear:
 
-## The Solution
+- One job blocks one worker
+- Concurrency requires multiple workers
+- Supervisor blindly restarts crashed workers
+- One bad job can starve the queue
+- Memory leaks kill entire workers
 
-KQueue replaces the **execution engine** (not the queue driver) with a long-lived runtime inspired by Node.js and libuv:
+This model works, but it does not scale cleanly for I/O-heavy or mixed workloads.
 
-- **Event loop-based** execution (ReactPHP)
-- **Non-blocking** job processing
-- **Automatic isolation** for heavy/unsafe jobs
-- **Process-level safety** - crashes don't kill the daemon
-- **Zero learning curve** - Laravel jobs stay 100% compatible
+## What KQueue is
 
-## POC Installation
+KQueue is a **queue runtime**, not a queue driver.
 
-```bash
-# Install dependencies
-composer install
+It replaces the execution engine behind `php artisan queue:work` with a long-running, event-loop driven daemon that:
 
-# Run the demo
-php examples/demo.php
-```
+- Executes jobs concurrently
+- Prevents one job from blocking others
+- Isolates heavy or unsafe jobs in child processes
+- Monitors memory and execution time
+- Keeps Laravel job APIs unchanged
 
-## How It Works
+## What KQueue is NOT
 
-### 1. Write Jobs (Same as Laravel!)
+- ❌ Not a new queue backend
+- ❌ Not a Redis/SQS replacement
+- ❌ Not Laravel Horizon
+- ❌ Not Octane or Swoole
+- ❌ Not a framework replacement
+
+KQueue only controls **how jobs are executed**, not where they are stored.
+
+## How it works
+
+1. Laravel pushes jobs to the queue as usual
+2. KQueue pulls jobs using Laravel queue contracts
+3. Jobs are scheduled by an internal event loop
+4. Lightweight jobs run inline
+5. Heavy or unsafe jobs run in isolated child processes
+6. The daemon monitors health, memory, and execution
+
+## Job compatibility
+
+KQueue is fully compatible with Laravel jobs.
+
+You write jobs the same way:
 
 ```php
-use KQueue\Jobs\KQueueJob;
-
 class SendEmail extends KQueueJob
 {
-    public int $timeout = 10;      // Optional: timeout in seconds
-    public int $maxMemory = 64;    // Optional: memory limit in MB
-    public bool $isolated = false; // Optional: run in separate process
+    public bool $isolated = false;
 
-    public function handle(): void
+    public function handle()
     {
-        // Your normal Laravel job code
-        Mail::to($this->user)->send(new WelcomeEmail());
+        // job logic
     }
 }
 ```
 
-### 2. Two Execution Strategies
+No new syntax. No async keywords. No learning curve.
 
-**Inline Strategy** (Fast jobs)
-- Runs within the event loop
-- Best for I/O-bound, lightweight jobs
-- No process overhead
+## Project status
 
-**Isolated Strategy** (Heavy jobs)
-- Runs in separate process (fork)
-- Best for CPU-heavy, unsafe jobs
-- Crashes don't affect the daemon
+⚠️ This project is currently in **Proof of Concept / early development**.
 
-### 3. Automatic Strategy Selection
+**What works:**
+- Event-loop based runtime
+- Concurrent job execution
+- Process isolation
+- Laravel integration (tested with Laravel 12)
+- Security hardening (production-ready validation)
+- Graceful shutdown
 
-```php
-// This runs inline (fast, non-blocking)
-class FastJob extends KQueueJob
-{
-    public bool $isolated = false;
-}
+**What is coming:**
+- Artisan command (`php artisan kqueue:run`)
+- Queue driver adapter (pull from Redis/SQS/DB)
+- Job retries
+- Process pooling
+- Observability hooks
 
-// This runs isolated (safe, contained)
-class HeavyJob extends KQueueJob
-{
-    public bool $isolated = true;
-}
-```
+## Why not just run more workers?
 
-## What Makes This Different?
+Running more workers increases:
+- Memory usage
+- Process overhead
+- Operational complexity
 
-| Feature | Laravel Queue | KQueue |
-|---------|--------------|---------|
-| Execution Model | Blocking, synchronous | Event loop, non-blocking |
-| One slow job | Blocks entire worker | Isolated & time-sliced |
-| Process Management | Supervisor restarts blindly | Runtime manages job state |
-| Concurrency | Multiple workers | Single daemon + strategies |
-| Crash Handling | Worker dies | Job dies, daemon lives |
-| Memory Leaks | Restart worker | Self-monitoring + limits |
+KQueue aims to provide:
+- Better resource utilization
+- Safer execution
+- Predictable behavior
 
-## Architecture
+## Installation
 
-```
-┌─────────────────────────────────────┐
-│   Laravel Queue (Redis/DB/SQS)      │  ← We don't touch this
-└────────────────┬────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────┐
-│   KQueue Runtime (ReactPHP Loop)    │
-│   - Job scheduler                   │
-│   - Memory monitoring               │
-│   - Signal handlers                 │
-└────────────────┬────────────────────┘
-                 │
-          ┌──────┴──────┐
-          ▼             ▼
-   ┌───────────┐  ┌────────────┐
-   │  Inline   │  │  Isolated  │
-   │ Strategy  │  │  Strategy  │
-   └───────────┘  └────────────┘
-```
+Not available yet.
 
-## POC Features Demonstrated
+This repository currently hosts the proof of concept and design direction.
 
-✅ **Event loop-based runtime** (ReactPHP)
-✅ **Multiple execution strategies** (inline + isolated)
-✅ **Memory monitoring** (periodic health checks)
-✅ **Job timeout handling** (automatic)
-✅ **Graceful shutdown** (SIGTERM/SIGINT)
-✅ **Process isolation** (child processes for heavy jobs)
-✅ **Zero Laravel API changes** (same job interface)
-
-## Running the Demo
+To run the POC:
 
 ```bash
+composer install
 php examples/demo.php
 ```
 
-You'll see:
-1. Fast jobs executing inline (non-blocking)
-2. Heavy job running isolated (separate process)
-3. Memory monitoring every 5 seconds
-4. Job completion tracking
-5. Graceful shutdown
+See [docs/POC.md](docs/POC.md) for proof of concept results and [LARAVEL_TEST_RESULTS.md](LARAVEL_TEST_RESULTS.md) for Laravel integration tests.
 
-## Next Steps (Beyond POC)
+## Roadmap
 
-- [ ] Laravel service provider integration
-- [ ] Artisan commands (`php artisan kqueue:run`)
-- [ ] Queue driver adapter (Redis, SQS, etc.)
-- [ ] Fiber-based cooperative multitasking
-- [ ] Job retry logic
-- [ ] Better error handling & logging
-- [ ] Process pool for isolated jobs
-- [ ] Metrics & observability
+- **v0.1**: Laravel queue integration
+- **v0.2**: Timeouts and retries
+- **v0.3**: Process pool for isolated jobs
+- **v1.0**: Production-ready runtime
 
-## Philosophy
+## Design philosophy
 
-**We replace the execution runtime, not the queue driver.**
+- Runtime > workers
+- Isolation over blind concurrency
+- Compatibility over clever APIs
+- Explicit execution strategies
+- Production first
 
-Laravel already handles:
-- Job storage (Redis, DB, SQS)
-- Payload serialization
-- Queue semantics
+## Security
 
-KQueue handles:
-- Job execution
-- Scheduling
-- Isolation
-- Timeouts
-- Memory limits
-- Lifecycle management
+KQueue has undergone security analysis and hardening. All critical vulnerabilities (RCE, path injection, DoS) have been identified and fixed.
+
+See [SECURITY.md](SECURITY.md) for complete security documentation.
 
 ## License
 

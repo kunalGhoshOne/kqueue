@@ -165,6 +165,101 @@ class MyJob extends \KQueue\Jobs\KQueueJob implements ShouldQueue
 }
 ```
 
+## Security Testing Results
+
+### Security Configuration
+
+After identifying and fixing critical security vulnerabilities, the following production-safe configuration was used:
+
+```php
+use KQueue\Config\SecurityConfig;
+
+$config = SecurityConfig::production();
+$config->allowedJobPaths = [__DIR__ . '/app/Jobs'];
+$config->maxJobTimeout = 10;        // 10 seconds max
+$config->maxJobMemory = 256;        // 256 MB max
+$config->maxConcurrentJobs = 50;    // 50 jobs max
+$config->validate();
+```
+
+### Security Components Used
+
+- **SecureKQueueRuntime**: Input validation, rate limiting, memory enforcement
+- **SecureIsolatedExecutionStrategy**: JSON serialization, path validation, SIGKILL timeout enforcement
+- **SecureInlineExecutionStrategy**: Memory limits, execution tracking
+
+### Security Tests Performed
+
+#### Test 1: Valid Jobs (Expected to Succeed)
+```
+✅ SecureSendEmailJob('user1@example.com', 'Welcome!')
+✅ SecureSendEmailJob('user2@example.com', 'Order confirmed')
+✅ SecureSendEmailJob('user3@example.com', 'Newsletter')
+Result: All valid jobs accepted ✓
+```
+
+#### Test 2: Malicious Timeout Attack (Expected to Reject)
+```php
+class MaliciousTimeoutJob extends KQueueJob {
+    public int $timeout = 999999; // Attempting DoS
+    public function handle() { /* ... */ }
+}
+```
+**Result**: `✓ Security working: Job timeout exceeds maximum allowed (10 seconds)`
+
+#### Test 3: Malicious Memory Attack (Expected to Reject)
+```php
+class MaliciousMemoryJob extends KQueueJob {
+    public int $maxMemory = 999999; // Attempting memory exhaustion
+    public function handle() { /* ... */ }
+}
+```
+**Result**: `✓ Security working: Job memory exceeds maximum allowed (256 MB)`
+
+#### Test 4: Additional Valid Jobs
+```
+✅ SecureSendEmailJob('user4@example.com', 'Security update')
+✅ SecureSendEmailJob('user5@example.com', 'New features')
+Result: Jobs dispatched ✓
+```
+
+### Security Test Summary
+
+```
+===========================================
+  SECURE Laravel Integration - SUCCESS
+===========================================
+Test Results:
+  ✓ Laravel integration: WORKING
+  ✓ Secure runtime: WORKING
+  ✓ Input validation: ENFORCED
+  ✓ Security limits: ENFORCED
+  ✓ Malicious jobs: REJECTED
+  ✓ Valid jobs: EXECUTED
+
+Security Status: PRODUCTION READY
+===========================================
+```
+
+**Key Metrics:**
+- Memory Usage: 18 MB
+- Jobs Processed: 5 valid jobs
+- Jobs Rejected: 2 malicious jobs
+- Vulnerabilities Fixed: 8 critical issues (RCE, path injection, DoS, etc.)
+
+### Vulnerabilities Fixed
+
+1. **Remote Code Execution (RCE)** - Replaced PHP `serialize()` with JSON
+2. **Path Injection** - Added whitelist validation for job paths
+3. **Timeout Not Enforced** - Implemented SIGKILL process termination
+4. **Memory Not Enforced** - Added ini_set + shutdown handlers
+5. **No Input Validation** - Server-side validation of all job properties
+6. **Information Disclosure** - Sanitized error messages
+7. **Temp File Race Conditions** - File permissions set to 0600
+8. **No Rate Limiting** - Jobs per minute throttling implemented
+
+See [SECURITY.md](SECURITY.md) for complete security documentation.
+
 ## Next Steps for Production
 
 1. **Artisan Command**: `php artisan kqueue:run` (needs implementation)

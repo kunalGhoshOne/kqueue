@@ -6,3 +6,10 @@ composer.lock
 *.log
 idea.txt
 disscuss.txt
+
+# Test Laravel applications
+laravel-test/
+
+# Temporary files
+/tmp/
+*.tmp
