@@ -1,15 +1,20 @@
 {
     "name": "kqueue/kqueue",
-    "description": "A production-grade Node.js-style runtime for Laravel queues",
+    "description": "A production-grade, event-loop based runtime for Laravel queues",
     "type": "library",
     "license": "MIT",
-    "keywords": ["laravel", "queue", "event-loop", "async", "runtime"],
+    "keywords": ["laravel", "queue", "event-loop", "async", "runtime", "reactphp", "non-blocking", "concurrent"],
+    "homepage": "https://github.com/kunalGhoshOne/kqueue",
     "authors": [
         {
             "name": "Kunal Ghosh",
             "email": "kunalghosh10000@gmail.com"
         }
     ],
+    "support": {
+        "issues": "https://github.com/kunalGhoshOne/kqueue/issues",
+        "source": "https://github.com/kunalGhoshOne/kqueue"
+    },
     "require": {
         "php": "^8.1",
         "illuminate/support": "^10.0|^11.0|^12.0",
