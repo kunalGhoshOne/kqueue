@@ -1,9 +1,11 @@
 /vendor/
+/node_modules/
 composer.lock
 .phpunit.result.cache
 .idea/
 .vscode/
 *.log
+.env
 idea.txt
 disscuss.txt
 
