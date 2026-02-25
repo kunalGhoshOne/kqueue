@@ -11,8 +11,14 @@ use React\Promise\PromiseInterface;
 use React\Promise\Deferred;
 
 /**
- * Executes jobs in isolated child processes
- * Best for unsafe, heavy, or crash-prone jobs
+ * Executes jobs in isolated child processes (CONCURRENT - DEFAULT)
+ *
+ * This is the DEFAULT strategy - the main reason KQueue exists!
+ * Jobs run concurrently in separate processes for true parallelism.
+ *
+ * To opt-out, set: public bool $isolated = false;
+ *
+ * Best for: CPU-intensive work, video processing, unsafe code, heavy jobs
  */
 class IsolatedExecutionStrategy implements ExecutionStrategy
 {
@@ -25,8 +31,8 @@ class IsolatedExecutionStrategy implements ExecutionStrategy
 
     public function canHandle(KQueueJobInterface $job): bool
     {
-        // Handle isolated jobs
-        return $job->isIsolated();
+        // Handle all jobs by default (unless explicitly set to false)
+        return $job->isIsolated() !== false;
     }
 
     public function execute(KQueueJobInterface $job): PromiseInterface
