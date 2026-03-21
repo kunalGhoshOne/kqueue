@@ -5,272 +5,176 @@ namespace KQueue\Runtime;
 use KQueue\Contracts\KQueueJobInterface;
 use KQueue\Execution\SmartExecutionStrategySelector;
 use KQueue\Analysis\JobAnalyzer;
-use React\EventLoop\Loop;
-use React\EventLoop\LoopInterface;
-use React\Promise\PromiseInterface;
+use KQueue\Swoole\SwooleStateManager;
 
 /**
- * Smart KQueue Runtime with Automatic Strategy Selection
+ * Smart KQueue runtime with automatic strategy selection and adaptive concurrency.
  *
- * Uses JobAnalyzer to automatically determine the best execution strategy
- * for each job, even if the user doesn't specify one.
+ * Uses JobAnalyzer to automatically determine the optimal execution strategy
+ * for each job based on code analysis, historical data, and name patterns.
+ * Dynamically adjusts the concurrency limit based on live CPU and memory metrics.
  *
- * Like Node.js import parser - analyzes jobs and makes smart decisions!
+ * Runs on Swoole coroutines — SWOOLE_HOOK_ALL makes all I/O non-blocking.
  */
 class SmartKQueueRuntime
 {
-    private LoopInterface $loop;
     private SmartExecutionStrategySelector $strategySelector;
-    private JobAnalyzer $analyzer;
-    private array $runningJobs = [];
-    private bool $running = false;
-    private int $memoryLimit;
-    private int $jobsProcessed = 0;
+    private JobAnalyzer                    $analyzer;
+    private array                          $runningJobs    = [];
+    private int                            $jobsProcessed  = 0;
+    private int                            $memoryLimit;
+    private ?int                           $statsTimerId   = null;
+    private ?SwooleStateManager            $stateManager;
 
-    // Conservative concurrency limits with smart learning
-    private int $maxConcurrentJobs = 10;        // Current limit (starts conservative)
-    private int $minConcurrentJobs = 3;         // Never go below this (safety)
-    private int $maxAllowedConcurrent = 20;     // Never exceed this (hard cap)
+    // Adaptive concurrency — starts conservative, learns from system health
+    private int   $maxConcurrentJobs  = 10;
+    private int   $minConcurrentJobs  = 3;
+    private int   $maxAllowedConcurrent = 20;
 
-    // System health thresholds (conservative)
-    private float $maxCpuLoad = 0.7;            // Max 70% CPU load
-    private float $maxMemoryPercent = 0.75;     // Max 75% memory usage
+    // Health thresholds
+    private float $maxCpuLoad        = 0.7;
+    private float $maxMemoryPercent  = 0.75;
 
-    // Performance tracking for learning
-    private float $lastHealthCheck = 0;
-    private int $healthCheckInterval = 30;      // Check every 30 seconds
-    private array $performanceMetrics = [];
+    private float $lastHealthCheck      = 0;
+    private int   $healthCheckInterval  = 30;
+    private array $performanceMetrics   = [];
 
     public function __construct(
-        ?LoopInterface $loop = null,
         ?SmartExecutionStrategySelector $strategySelector = null,
         ?JobAnalyzer $analyzer = null,
-        int $memoryLimitMB = 512
+        int $memoryLimitMB = 512,
+        ?SwooleStateManager $stateManager = null
     ) {
-        $this->loop = $loop ?? Loop::get();
-        $this->analyzer = $analyzer ?? new JobAnalyzer();
+        $this->analyzer        = $analyzer ?? new JobAnalyzer();
         $this->strategySelector = $strategySelector ?? new SmartExecutionStrategySelector($this->analyzer);
-        $this->memoryLimit = $memoryLimitMB * 1024 * 1024;
-        $this->setupSignalHandlers();
+        $this->memoryLimit     = $memoryLimitMB * 1024 * 1024;
+        $this->stateManager    = $stateManager;
     }
 
-    /**
-     * Get the strategy selector (for registering strategies)
-     */
     public function getStrategySelector(): SmartExecutionStrategySelector
     {
         return $this->strategySelector;
     }
 
-    /**
-     * Get the job analyzer (for configuring thresholds)
-     */
     public function getAnalyzer(): JobAnalyzer
     {
         return $this->analyzer;
     }
 
-    /**
-     * Execute a job using smart strategy selection
-     */
-    public function executeJob(KQueueJobInterface $job): PromiseInterface
-    {
-        $startTime = microtime(true);
-
-        // CONSERVATIVE LIMIT - Prevent system overload
+    public function executeJob(
+        KQueueJobInterface $job,
+        ?callable $onSuccess = null,
+        ?callable $onFailure = null
+    ): void {
         if (count($this->runningJobs) >= $this->maxConcurrentJobs) {
             throw new \RuntimeException(sprintf(
-                "Maximum concurrent jobs limit reached (%d). System is protecting itself from overload.",
+                'Max concurrent jobs limit reached (%d). System protecting itself from overload.',
                 $this->maxConcurrentJobs
             ));
         }
 
-        // Check system health and adjust limits if needed
         $this->monitorSystemHealth();
 
-        // SMART SELECTION - Automatically choose best strategy!
-        $strategy = $this->strategySelector->selectStrategy($job);
+        $strategy  = $this->strategySelector->selectStrategy($job);
+        $jobId     = $job->getJobId();
+        $startTime = microtime(true);
 
-        $this->runningJobs[$job->getJobId()] = [
-            'job' => $job,
+        $this->runningJobs[$jobId] = [
             'started_at' => $startTime,
-            'strategy' => get_class($strategy)
+            'strategy'   => (new \ReflectionClass($strategy))->getShortName(),
         ];
 
         echo sprintf(
-            "[%s] 🧠 Smart execution: %s (strategy: %s)\n",
+            "[%s] Smart execution: %s (strategy: %s)\n",
             date('Y-m-d H:i:s'),
-            $job->getJobId(),
-            $this->getShortStrategyName(get_class($strategy))
+            $jobId,
+            (new \ReflectionClass($strategy))->getShortName()
         );
 
-        $promise = $strategy->execute($job);
+        \Swoole\Coroutine::create(function () use ($job, $strategy, $jobId, $startTime, $onSuccess, $onFailure) {
+            $this->stateManager?->prepareForJob();
 
-        // Monitor timeout
-        $timer = $this->loop->addTimer($job->getTimeout(), function() use ($job) {
-            echo sprintf(
-                "[%s] ⏱️ Job %s timed out after %d seconds\n",
-                date('Y-m-d H:i:s'),
-                $job->getJobId(),
-                $job->getTimeout()
-            );
-            unset($this->runningJobs[$job->getJobId()]);
-        });
+            try {
+                $strategy->execute($job);
 
-        // Handle completion
-        $promise->then(
-            function() use ($job, $timer, $startTime) {
-                $this->loop->cancelTimer($timer);
-                $duration = microtime(true) - $startTime;
+                $duration = round(microtime(true) - $startTime, 2);
+                echo sprintf("[%s] Job %s completed in %.2fs\n", date('Y-m-d H:i:s'), $jobId, $duration);
 
-                echo sprintf(
-                    "[%s] ✅ Job %s completed in %.2fs\n",
-                    date('Y-m-d H:i:s'),
-                    $job->getJobId(),
-                    $duration
-                );
-
-                // Record execution for learning
                 $this->analyzer->recordExecution(get_class($job), $duration, true);
-
-                unset($this->runningJobs[$job->getJobId()]);
+                unset($this->runningJobs[$jobId]);
                 $this->jobsProcessed++;
-            },
-            function($error) use ($job, $timer, $startTime) {
-                $this->loop->cancelTimer($timer);
-                $duration = microtime(true) - $startTime;
+                $onSuccess && $onSuccess();
+            } catch (\Throwable $e) {
+                $duration = round(microtime(true) - $startTime, 2);
+                echo sprintf("[%s] Job %s failed: %s\n", date('Y-m-d H:i:s'), $jobId, $e->getMessage());
 
-                echo sprintf(
-                    "[%s] ❌ Job %s failed: %s\n",
-                    date('Y-m-d H:i:s'),
-                    $job->getJobId(),
-                    $error
-                );
-
-                // Record failure for learning
                 $this->analyzer->recordExecution(get_class($job), $duration, false);
-
-                unset($this->runningJobs[$job->getJobId()]);
+                unset($this->runningJobs[$jobId]);
+                $onFailure && $onFailure($e);
+            } finally {
+                $this->stateManager?->cleanupAfterJob();
             }
-        );
-
-        return $promise;
+        });
     }
 
-    /**
-     * Start the runtime
-     */
     public function start(): void
     {
-        $this->running = true;
+        echo sprintf("[%s] Smart KQueue Runtime started (PID: %d)\n", date('Y-m-d H:i:s'), getmypid());
 
-        echo sprintf(
-            "[%s] 🚀 Smart KQueue Runtime started (PID: %d)\n",
-            date('Y-m-d H:i:s'),
-            getmypid()
-        );
-
-        // Memory and stats monitor
-        $this->loop->addPeriodicTimer(10.0, function() {
-            $memory = memory_get_usage(true);
+        $this->statsTimerId = \Swoole\Timer::tick(10000, function () {
+            $memMB         = round(memory_get_usage(true) / 1024 / 1024, 2);
             $strategyStats = $this->strategySelector->getStats();
 
             echo sprintf(
-                "[%s] 📊 Memory: %.2f MB | Jobs: %d | Running: %d | Strategies: %s\n",
-                date('Y-m-d H:i:s'),
-                $memory / 1024 / 1024,
+                "[%s] Memory: %.2fMB | Processed: %d | Running: %d | Concurrency limit: %d | Strategies: %s\n",
+                date('H:i:s'),
+                $memMB,
                 $this->jobsProcessed,
                 count($this->runningJobs),
+                $this->maxConcurrentJobs,
                 json_encode($strategyStats)
             );
 
-            if ($memory > $this->memoryLimit) {
-                echo "[WARNING] Memory limit exceeded, consider restart\n";
+            if (memory_get_usage(true) > $this->memoryLimit) {
+                echo "[WARNING] Memory limit exceeded — consider restarting\n";
             }
         });
-
-        $this->loop->run();
     }
 
-    /**
-     * Stop the runtime gracefully
-     */
     public function stop(): void
     {
         echo sprintf(
-            "[%s] 🛑 Shutting down gracefully... (Running jobs: %d)\n",
-            date('Y-m-d H:i:s'),
+            "[%s] Shutting down... (%d jobs still running)\n",
+            date('H:i:s'),
             count($this->runningJobs)
         );
 
-        $this->running = false;
-        $this->loop->stop();
-    }
-
-    /**
-     * Get the event loop
-     */
-    public function getLoop(): LoopInterface
-    {
-        return $this->loop;
-    }
-
-    /**
-     * Setup signal handlers for graceful shutdown
-     */
-    private function setupSignalHandlers(): void
-    {
-        if (function_exists('pcntl_signal')) {
-            pcntl_async_signals(true);
-
-            pcntl_signal(SIGTERM, function() {
-                $this->stop();
-            });
-
-            pcntl_signal(SIGINT, function() {
-                $this->stop();
-            });
+        if ($this->statsTimerId !== null) {
+            \Swoole\Timer::clear($this->statsTimerId);
+            $this->statsTimerId = null;
         }
     }
 
-    /**
-     * Get short strategy name for display
-     */
-    private function getShortStrategyName(string $fullClassName): string
-    {
-        $parts = explode('\\', $fullClassName);
-        return end($parts);
-    }
-
-    /**
-     * Get runtime statistics
-     */
     public function getStats(): array
     {
         return [
-            'jobs_processed' => $this->jobsProcessed,
-            'running_jobs' => count($this->runningJobs),
-            'memory_usage_mb' => memory_get_usage(true) / 1024 / 1024,
-            'strategy_stats' => $this->strategySelector->getStats(),
-            'max_concurrent' => $this->maxConcurrentJobs,
-            'system_health' => $this->getSystemHealth(),
+            'jobs_processed'  => $this->jobsProcessed,
+            'running_jobs'    => count($this->runningJobs),
+            'memory_usage_mb' => round(memory_get_usage(true) / 1024 / 1024, 2),
+            'strategy_stats'  => $this->strategySelector->getStats(),
+            'max_concurrent'  => $this->maxConcurrentJobs,
+            'system_health'   => $this->getSystemHealth(),
         ];
     }
 
     /**
-     * Monitor system health and dynamically adjust concurrency limits
-     *
-     * CONSERVATIVE APPROACH:
-     * - Reduces limit quickly when system is stressed
-     * - Increases limit slowly when system is healthy
-     * - Never exceeds hard cap (20)
-     * - Never goes below minimum (3)
+     * Dynamically adjust the concurrency limit based on system health.
+     * Reduces quickly under stress, increases slowly when healthy.
      */
     private function monitorSystemHealth(): void
     {
         $now = microtime(true);
 
-        // Only check every 30 seconds (avoid overhead)
         if ($now - $this->lastHealthCheck < $this->healthCheckInterval) {
             return;
         }
@@ -278,88 +182,66 @@ class SmartKQueueRuntime
         $this->lastHealthCheck = $now;
         $health = $this->getSystemHealth();
 
-        // Record metrics for learning
         $this->performanceMetrics[] = [
-            'timestamp' => $now,
-            'concurrent_jobs' => count($this->runningJobs),
-            'cpu_load' => $health['cpu_load'],
+            'timestamp'      => $now,
+            'concurrent'     => count($this->runningJobs),
+            'cpu_load'       => $health['cpu_load'],
             'memory_percent' => $health['memory_percent'],
         ];
 
-        // Keep only last 10 measurements
         if (count($this->performanceMetrics) > 10) {
             array_shift($this->performanceMetrics);
         }
 
-        // CONSERVATIVE: Reduce limit if system is stressed
         if ($health['is_stressed']) {
-            $oldLimit = $this->maxConcurrentJobs;
+            $old = $this->maxConcurrentJobs;
             $this->maxConcurrentJobs = max(
                 $this->minConcurrentJobs,
                 (int) ($this->maxConcurrentJobs * 0.7) // Reduce by 30%
             );
 
-            if ($oldLimit !== $this->maxConcurrentJobs) {
+            if ($old !== $this->maxConcurrentJobs) {
                 echo sprintf(
-                    "[%s] ⚠️ System stressed! Reducing concurrent limit: %d → %d\n",
-                    date('Y-m-d H:i:s'),
-                    $oldLimit,
-                    $this->maxConcurrentJobs
+                    "[%s] System stressed — concurrency limit: %d -> %d\n",
+                    date('H:i:s'), $old, $this->maxConcurrentJobs
                 );
             }
-        }
-        // CONSERVATIVE: Increase limit slowly if system is healthy
-        elseif ($health['is_healthy'] && count($this->runningJobs) >= $this->maxConcurrentJobs * 0.8) {
-            $oldLimit = $this->maxConcurrentJobs;
+        } elseif ($health['is_healthy'] && count($this->runningJobs) >= $this->maxConcurrentJobs * 0.8) {
+            $old = $this->maxConcurrentJobs;
             $this->maxConcurrentJobs = min(
                 $this->maxAllowedConcurrent,
-                $this->maxConcurrentJobs + 1  // Increase by just 1 (very conservative)
+                $this->maxConcurrentJobs + 1 // Increase slowly — 1 at a time
             );
 
-            if ($oldLimit !== $this->maxConcurrentJobs) {
+            if ($old !== $this->maxConcurrentJobs) {
                 echo sprintf(
-                    "[%s] ✅ System healthy! Increasing concurrent limit: %d → %d\n",
-                    date('Y-m-d H:i:s'),
-                    $oldLimit,
-                    $this->maxConcurrentJobs
+                    "[%s] System healthy — concurrency limit: %d -> %d\n",
+                    date('H:i:s'), $old, $this->maxConcurrentJobs
                 );
             }
         }
     }
 
-    /**
-     * Get current system health metrics
-     */
     private function getSystemHealth(): array
     {
-        // Get CPU load average (last 1 minute)
         $cpuLoad = 0.0;
         if (function_exists('sys_getloadavg')) {
             $loadAvg = sys_getloadavg();
-            $cpuCores = $this->getCpuCores();
-            $cpuLoad = $loadAvg[0] / $cpuCores; // Normalize by CPU cores
+            $cpuLoad = $loadAvg[0] / $this->getCpuCores();
         }
 
-        // Get memory usage percentage
-        $memoryUsed = memory_get_usage(true);
+        $memoryUsed    = memory_get_usage(true);
         $memoryPercent = $memoryUsed / $this->memoryLimit;
 
-        // Determine if system is stressed or healthy
-        $isStressed = $cpuLoad > $this->maxCpuLoad || $memoryPercent > $this->maxMemoryPercent;
-        $isHealthy = $cpuLoad < ($this->maxCpuLoad * 0.5) && $memoryPercent < ($this->maxMemoryPercent * 0.5);
-
         return [
-            'cpu_load' => round($cpuLoad, 2),
+            'cpu_load'       => round($cpuLoad, 2),
             'memory_percent' => round($memoryPercent, 2),
-            'memory_mb' => round($memoryUsed / 1024 / 1024, 2),
-            'is_stressed' => $isStressed,
-            'is_healthy' => $isHealthy,
+            'memory_mb'      => round($memoryUsed / 1024 / 1024, 2),
+            'is_stressed'    => $cpuLoad > $this->maxCpuLoad || $memoryPercent > $this->maxMemoryPercent,
+            'is_healthy'     => $cpuLoad < ($this->maxCpuLoad * 0.5) && $memoryPercent < ($this->maxMemoryPercent * 0.5),
         ];
     }
 
-    /**
-     * Get number of CPU cores
-     */
     private function getCpuCores(): int
     {
         static $cores = null;
@@ -368,18 +250,11 @@ class SmartKQueueRuntime
             return $cores;
         }
 
-        // Try different methods to detect CPU cores
         if (is_file('/proc/cpuinfo')) {
-            $cpuinfo = file_get_contents('/proc/cpuinfo');
-            preg_match_all('/^processor/m', $cpuinfo, $matches);
+            preg_match_all('/^processor/m', file_get_contents('/proc/cpuinfo'), $matches);
             $cores = count($matches[0]);
         }
 
-        // Fallback
-        if (!$cores) {
-            $cores = 2; // Conservative fallback
-        }
-
-        return $cores;
+        return $cores ?: 2;
     }
 }

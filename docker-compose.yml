@@ -1,12 +1,32 @@
 version: '3.8'
 
 services:
-  kqueue:
+  redis:
+    image: redis:7-alpine
+    container_name: kqueue_redis
+
+  laravel-test:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: kqueue_poc
+      dockerfile: Dockerfile.laravel
+    container_name: kqueue_laravel_test
+    depends_on:
+      - redis
+    environment:
+      - QUEUE_CONNECTION=redis
+      - REDIS_CLIENT=phpredis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
     volumes:
-      - .:/app
-    tty: true
-    stdin_open: true
+      - .:/kqueue-package
+      - ./laravel-test/laravel-app/laravel-app:/var/www
+    command: >
+      bash -c "
+        composer install --no-interaction --quiet &&
+        php artisan config:clear --quiet &&
+        php kqueue-concurrency-test.php &&
+        echo '' &&
+        echo '--- Starting kqueue:work (expect ~2s total) ---' &&
+        echo '' &&
+        time php artisan kqueue:work redis --queue=default --max-jobs=5 --inline
+      "

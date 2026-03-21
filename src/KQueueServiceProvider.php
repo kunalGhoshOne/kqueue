@@ -9,29 +9,26 @@ use KQueue\Runtime\SecureKQueueRuntime;
 use KQueue\Runtime\SmartKQueueRuntime;
 use KQueue\Analysis\JobAnalyzer;
 use KQueue\Execution\SmartExecutionStrategySelector;
+use KQueue\Swoole\SwooleStateManager;
 
 class KQueueServiceProvider extends ServiceProvider
 {
-    /**
-     * Register services.
-     */
     public function register(): void
     {
-        // Merge package configuration
-        $this->mergeConfigFrom(
-            __DIR__ . '/../config/kqueue.php',
-            'kqueue'
-        );
+        $this->mergeConfigFrom(__DIR__ . '/../config/kqueue.php', 'kqueue');
 
-        // Register KQueue runtime as singleton
+        $this->app->singleton(SwooleStateManager::class, function ($app) {
+            $resettable = $app['config']['kqueue']['swoole']['resettable_singletons'] ?? [];
+            return new SwooleStateManager($resettable);
+        });
+
         $this->app->singleton('kqueue.runtime', function ($app) {
-            $config = $app['config']['kqueue'];
+            $config       = $app['config']['kqueue'];
+            $useSmart     = $config['runtime']['smart']  ?? true;
+            $useSecure    = $config['runtime']['secure'] ?? true;
+            $memoryLimit  = $config['runtime']['memory_limit'] ?? 512;
+            $stateManager = $app->make(SwooleStateManager::class);
 
-            // Determine runtime mode
-            $useSmart = $config['runtime']['smart'] ?? true;
-            $useSecure = $config['runtime']['secure'] ?? true;
-
-            // Smart runtime with automatic strategy selection
             if ($useSmart) {
                 $analyzer = new JobAnalyzer(
                     inlineThreshold: $config['analysis']['inline_threshold'] ?? 1.0,
@@ -39,42 +36,36 @@ class KQueueServiceProvider extends ServiceProvider
                 );
 
                 return new SmartKQueueRuntime(
-                    loop: null,
                     strategySelector: null,
                     analyzer: $analyzer,
-                    memoryLimitMB: $config['runtime']['memory_limit'] ?? 512
+                    memoryLimitMB: $memoryLimit,
+                    stateManager: $stateManager
                 );
             }
 
-            // Secure runtime (original)
             if ($useSecure) {
                 return new SecureKQueueRuntime(
-                    null,
-                    $config['runtime']['memory_limit'] ?? 512,
-                    $config['jobs']['max_timeout'] ?? 300,
-                    $config['jobs']['max_memory'] ?? 512,
-                    $config['jobs']['max_concurrent'] ?? 100
+                    memoryLimitMB: $memoryLimit,
+                    maxJobTimeout: $config['jobs']['max_timeout'] ?? 300,
+                    maxJobMemory: $config['jobs']['max_memory']   ?? 512,
+                    maxConcurrentJobs: $config['jobs']['max_concurrent'] ?? 100,
+                    stateManager: $stateManager
                 );
             }
 
-            // Basic runtime
             return new KQueueRuntime(
-                memoryLimitMB: $config['runtime']['memory_limit'] ?? 512
+                memoryLimitMB: $memoryLimit,
+                stateManager: $stateManager
             );
         });
     }
 
-    /**
-     * Bootstrap services.
-     */
     public function boot(): void
     {
-        // Publish configuration file
         $this->publishes([
             __DIR__ . '/../config/kqueue.php' => config_path('kqueue.php'),
         ], 'kqueue-config');
 
-        // Register console commands
         if ($this->app->runningInConsole()) {
             $this->commands([
                 KQueueWorkCommand::class,

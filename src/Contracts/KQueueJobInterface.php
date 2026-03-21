@@ -21,8 +21,9 @@ interface KQueueJobInterface
 
     /**
      * Should this job run isolated (in separate process)?
+     * Return null to let the system auto-detect via code analysis.
      */
-    public function isIsolated(): bool;
+    public function isIsolated(): ?bool;
 
     /**
      * Get job priority (higher = more important)

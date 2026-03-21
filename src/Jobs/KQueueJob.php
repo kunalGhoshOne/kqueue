@@ -4,9 +4,15 @@ namespace KQueue\Jobs;
 
 use KQueue\Contracts\KQueueJobInterface;
 use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Bus\Queueable;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
 
 abstract class KQueueJob implements KQueueJobInterface, ShouldQueue
 {
+    use Dispatchable, Queueable, InteractsWithQueue, SerializesModels;
+
     /**
      * Job timeout in seconds
      */
@@ -19,8 +25,10 @@ abstract class KQueueJob implements KQueueJobInterface, ShouldQueue
 
     /**
      * Should run in isolated process?
+     * null = auto-detect via JobAnalyzer code analysis
+     * true = always isolated, false = always inline
      */
-    public bool $isolated = false;
+    public ?bool $isolated = null;
 
     /**
      * Job priority (higher = more important)
@@ -52,7 +60,7 @@ abstract class KQueueJob implements KQueueJobInterface, ShouldQueue
         return $this->maxMemory;
     }
 
-    public function isIsolated(): bool
+    public function isIsolated(): ?bool
     {
         return $this->isolated;
     }

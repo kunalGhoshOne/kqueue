@@ -6,45 +6,55 @@ return [
     |--------------------------------------------------------------------------
     | Default Queue Connection
     |--------------------------------------------------------------------------
-    |
-    | The queue connection to use when none is specified. This should match
-    | a connection defined in your config/queue.php file.
-    |
     */
-
     'default_connection' => env('KQUEUE_CONNECTION', env('QUEUE_CONNECTION', 'redis')),
 
     /*
     |--------------------------------------------------------------------------
     | Default Queue Name
     |--------------------------------------------------------------------------
-    |
-    | The default queue to process jobs from when none is specified.
-    |
     */
-
     'default_queue' => env('KQUEUE_QUEUE', 'default'),
 
     /*
     |--------------------------------------------------------------------------
     | Runtime Configuration
     |--------------------------------------------------------------------------
-    |
-    | Configure the KQueue runtime behavior.
-    |
     */
-
     'runtime' => [
-        // Total memory limit for the runtime in MB
         'memory_limit' => (int) env('KQUEUE_MEMORY', 512),
 
-        // Use smart runtime with automatic strategy selection
-        // TRUE = Automatic detection of job types (RECOMMENDED!)
-        // FALSE = Manual strategy selection via job properties
-        'smart' => env('KQUEUE_SMART', true),
+        // Smart runtime: automatically detects the best strategy per job
+        'smart'  => env('KQUEUE_SMART', true),
 
-        // Use secure runtime with hardened security features
+        // Secure runtime: adds validation, rate limiting, sanitized logging
         'secure' => env('KQUEUE_SECURE', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Swoole Configuration
+    |--------------------------------------------------------------------------
+    |
+    | KQueue enables SWOOLE_HOOK_ALL automatically — sleep(), DB, HTTP, file
+    | I/O become non-blocking with zero changes to your job code.
+    |
+    | SwooleStateManager resets these Laravel singletons before each job to
+    | prevent state leaking between jobs. Add your own service container
+    | bindings to this list if you observe stale state in your application.
+    |
+    */
+    'swoole' => [
+        'resettable_singletons' => [
+            'auth',
+            'auth.driver',
+            'db',
+            'db.connection',
+            'cache',
+            'cache.store',
+            'session',
+            'session.store',
+        ],
     ],
 
     /*
@@ -52,18 +62,15 @@ return [
     | Smart Analysis Configuration
     |--------------------------------------------------------------------------
     |
-    | Configure thresholds for automatic job analysis and strategy selection.
-    | The analyzer determines optimal execution mode based on job characteristics.
+    | The JobAnalyzer estimates how long a job will run and selects the
+    | appropriate execution strategy automatically.
     |
     */
-
     'analysis' => [
-        // Jobs with estimated duration <= this run INLINE (same process)
-        // Default: 1.0 second
+        // Jobs estimated <= this run INLINE as coroutines (I/O-bound, fast)
         'inline_threshold' => (float) env('KQUEUE_INLINE_THRESHOLD', 1.0),
 
-        // Jobs with estimated duration <= this run in WORKER POOL
-        // Default: 30.0 seconds
+        // Jobs estimated <= this run in a POOLED process
         'pooled_threshold' => (float) env('KQUEUE_POOLED_THRESHOLD', 30.0),
 
         // Jobs over pooled_threshold run ISOLATED (dedicated process)
@@ -73,19 +80,15 @@ return [
     |--------------------------------------------------------------------------
     | Worker Configuration
     |--------------------------------------------------------------------------
-    |
-    | Configure worker behavior and resource limits.
-    |
     */
-
     'worker' => [
-        // Poll interval in milliseconds (how often to check for new jobs)
-        'sleep' => 100,
+        // How often to poll the queue (milliseconds)
+        'sleep'    => 100,
 
-        // Maximum number of jobs to process before restarting (0 = unlimited)
+        // Max jobs before worker restarts (0 = unlimited)
         'max_jobs' => 0,
 
-        // Maximum time to run before restarting in seconds (0 = unlimited)
+        // Max seconds before worker restarts (0 = unlimited)
         'max_time' => 0,
     ],
 
@@ -93,30 +96,18 @@ return [
     |--------------------------------------------------------------------------
     | Job Configuration
     |--------------------------------------------------------------------------
-    |
-    | Default settings and server-side limits for job execution.
-    |
     */
-
     'jobs' => [
-        // Default timeout for jobs in seconds (if not specified by job)
-        'default_timeout' => 60,
+        'default_timeout'    => 60,
+        'default_memory'     => 128,
 
-        // Default memory limit for jobs in MB (if not specified by job)
-        'default_memory' => 128,
-
-        // Run all jobs in isolated processes by default
-        // TRUE = Concurrent execution (KQueue's main value!)
-        // FALSE = Sequential inline execution (opt-in for lightweight jobs)
+        // Run all jobs in isolated processes by default (true = concurrent)
+        // Set to false for sequential/inline by default
         'isolated_by_default' => true,
 
-        // Server-side maximum timeout (cannot be exceeded by jobs)
-        'max_timeout' => 300,
-
-        // Server-side maximum memory (cannot be exceeded by jobs)
-        'max_memory' => 512,
-
-        // Maximum concurrent jobs
+        // Server-side hard limits — jobs cannot exceed these
+        'max_timeout'    => 300,
+        'max_memory'     => 512,
         'max_concurrent' => 100,
     ],
 
@@ -124,19 +115,16 @@ return [
     |--------------------------------------------------------------------------
     | Security Configuration
     |--------------------------------------------------------------------------
-    |
-    | Security settings for production deployments.
-    |
     */
-
     'security' => [
-        // Allowed paths for job class files (whitelist for isolated execution)
-        // Empty array allows all paths (development only!)
+        // Whitelist for isolated job class files.
+        // Empty = allow all (fine for development).
+        // Set to [app_path('Jobs')] in production.
         'allowed_job_paths' => [
             app_path('Jobs'),
         ],
 
-        // Rate limiting: Maximum jobs per minute
+        // Max jobs accepted per minute (rate limiting)
         'max_jobs_per_minute' => 1000,
     ],
 

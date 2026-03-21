@@ -5,75 +5,66 @@ namespace KQueue\Execution;
 use KQueue\Contracts\ExecutionStrategy;
 use KQueue\Contracts\KQueueJobInterface;
 use KQueue\Queue\LaravelJobAdapter;
-use React\ChildProcess\Process;
-use React\EventLoop\Loop;
-use React\EventLoop\LoopInterface;
-use React\Promise\PromiseInterface;
-use React\Promise\Deferred;
 
 /**
- * SECURE Isolated Execution Strategy for Laravel Jobs
+ * Secure isolated execution for Laravel jobs (LaravelJobAdapter).
  *
- * This strategy handles LaravelJobAdapter objects by executing
- * the job in a child process using Laravel's job system.
+ * Bootstraps a full Laravel application in a child process and executes
+ * the job with proper dependency injection. The coroutine suspends
+ * non-blocking while waiting — all other jobs keep running.
+ *
+ * Enforces server-side timeout and memory limits. Validates timeout
+ * and memory before spawning to prevent DoS via malformed jobs.
  */
 class SecureLaravelIsolatedExecutionStrategy implements ExecutionStrategy
 {
-    private LoopInterface $loop;
     private int $maxTimeout;
     private int $maxMemory;
 
-    public function __construct(
-        ?LoopInterface $loop = null,
-        int $maxTimeout = 300,      // 5 minutes max
-        int $maxMemory = 512        // 512MB max
-    ) {
-        $this->loop = $loop ?? Loop::get();
+    public function __construct(int $maxTimeout = 300, int $maxMemory = 512)
+    {
         $this->maxTimeout = $maxTimeout;
-        $this->maxMemory = $maxMemory;
+        $this->maxMemory  = $maxMemory;
     }
 
     public function canHandle(KQueueJobInterface $job): bool
     {
-        // Handle LaravelJobAdapter objects that need isolation
-        return $job->isIsolated() && $job instanceof LaravelJobAdapter;
+        return $job->isIsolated() !== false && $job instanceof LaravelJobAdapter;
     }
 
-    public function execute(KQueueJobInterface $job): PromiseInterface
+    public function execute(KQueueJobInterface $job): void
     {
-        $deferred = new Deferred();
+        $this->validateJobProperties($job);
 
-        try {
-            // Validate job properties
-            $this->validateJobProperties($job);
+        $timeout = min($job->getTimeout(), $this->maxTimeout);
+        $tmpFile = $this->createJobScript($job);
 
-            // Create a temporary PHP file that uses Laravel's job fire method
-            $tmpFile = $this->createJobScript($job);
+        // Coroutine suspends here — non-blocking wait for child process
+        $result = \Swoole\Coroutine\System::exec(
+            sprintf('timeout %d php %s 2>&1', $timeout, escapeshellarg($tmpFile))
+        );
 
-            // Execute with timeout enforcement
-            $this->executeWithTimeout($tmpFile, $job, $deferred);
+        @unlink($tmpFile);
 
-        } catch (\Throwable $e) {
-            $deferred->reject($e);
+        if ($result['code'] === 124) {
+            throw new \RuntimeException("Job exceeded timeout of {$timeout} seconds and was killed");
         }
 
-        return $deferred->promise();
+        if ($result['code'] !== 0) {
+            throw new \RuntimeException($result['output'] ?: "Process exited with code {$result['code']}");
+        }
     }
 
-    /**
-     * Validate job properties to prevent DoS
-     */
     private function validateJobProperties(KQueueJobInterface $job): void
     {
         $timeout = $job->getTimeout();
-        $memory = $job->getMaxMemory();
-
         if ($timeout <= 0 || $timeout > $this->maxTimeout) {
             throw new \InvalidArgumentException(
                 "Job timeout must be between 1 and {$this->maxTimeout} seconds, got: {$timeout}"
             );
         }
 
+        $memory = $job->getMaxMemory();
         if ($memory <= 0 || $memory > $this->maxMemory) {
             throw new \InvalidArgumentException(
                 "Job memory must be between 1 and {$this->maxMemory} MB, got: {$memory}"
@@ -81,40 +72,36 @@ class SecureLaravelIsolatedExecutionStrategy implements ExecutionStrategy
         }
     }
 
-    /**
-     * Create temporary PHP script to execute Laravel job
-     */
-    private function createJobScript(LaravelJobAdapter $jobAdapter): string
+    private function createJobScript(KQueueJobInterface $job): string
     {
+        /** @var LaravelJobAdapter $job */
         $tmpFile = tempnam(sys_get_temp_dir(), 'kqueue_laravel_job_');
         chmod($tmpFile, 0600);
 
-        // Serialize the Laravel job and adapter data
-        $laravelJob = $jobAdapter->getLaravelJob();
-        $jobData = base64_encode(serialize($laravelJob));
-        $memoryLimit = $jobAdapter->getMaxMemory();
+        $laravelJob       = $job->getLaravelJob();
+        $payload          = $laravelJob->payload();
+        $serializedCommand = $payload['data']['command'] ?? null;
 
-        // Find Laravel base path
-        $laravelBasePath = base_path();
+        if (!$serializedCommand) {
+            throw new \RuntimeException('No command found in job payload');
+        }
+
+        $jobData      = base64_encode($serializedCommand);
+        $memoryLimit  = min($job->getMaxMemory(), $this->maxMemory);
+        $basePath     = base_path();
 
         $script = <<<PHP
 <?php
-// Set memory limit
 ini_set('memory_limit', '{$memoryLimit}M');
-
-// Bootstrap Laravel
-require_once '{$laravelBasePath}/vendor/autoload.php';
-\$app = require_once '{$laravelBasePath}/bootstrap/app.php';
+require_once '{$basePath}/vendor/autoload.php';
+\$app = require_once '{$basePath}/bootstrap/app.php';
 \$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-
-// Deserialize and execute Laravel job
 try {
-    \$laravelJob = unserialize(base64_decode('{$jobData}'));
-    \$laravelJob->fire();
+    \$command = unserialize(base64_decode('{$jobData}'));
+    \$app->call([\$command, 'handle']);
     exit(0);
 } catch (\Throwable \$e) {
     fwrite(STDERR, "Job failed: " . \$e->getMessage() . "\\n");
-    fwrite(STDERR, \$e->getTraceAsString());
     exit(1);
 }
 PHP;
@@ -122,60 +109,5 @@ PHP;
         file_put_contents($tmpFile, $script);
 
         return $tmpFile;
-    }
-
-    /**
-     * Execute with enforced timeout
-     */
-    private function executeWithTimeout(
-        string $tmpFile,
-        KQueueJobInterface $job,
-        Deferred $deferred
-    ): void {
-        $process = new Process('php ' . escapeshellarg($tmpFile));
-        $process->start($this->loop);
-
-        $stderr = '';
-        $stdout = '';
-        $timeoutTimer = null;
-        $isTimedOut = false;
-
-        // Enforce timeout by killing the process
-        $timeoutTimer = $this->loop->addTimer($job->getTimeout(), function() use ($process, &$isTimedOut) {
-            if ($process->isRunning()) {
-                $isTimedOut = true;
-                $process->terminate(SIGKILL);
-            }
-        });
-
-        $process->stdout->on('data', function($data) use (&$stdout) {
-            $stdout .= $data;
-            echo $data; // Forward output
-        });
-
-        $process->stderr->on('data', function($data) use (&$stderr) {
-            $stderr .= $data;
-        });
-
-        $process->on('exit', function($exitCode) use ($deferred, &$stderr, $tmpFile, $timeoutTimer, &$isTimedOut) {
-            // Cancel timeout timer
-            if ($timeoutTimer) {
-                $this->loop->cancelTimer($timeoutTimer);
-            }
-
-            // Clean up temp file
-            if (file_exists($tmpFile)) {
-                @unlink($tmpFile);
-            }
-
-            if ($isTimedOut) {
-                $deferred->reject(new \RuntimeException("Job exceeded timeout and was killed"));
-            } elseif ($exitCode === 0) {
-                $deferred->resolve(null);
-            } else {
-                $error = $stderr ?: 'Process exited with code ' . $exitCode;
-                $deferred->reject(new \RuntimeException($error));
-            }
-        });
     }
 }

@@ -17,7 +17,7 @@ class LaravelJobAdapter implements KQueueJobInterface
     private Job $laravelJob;
     private int $timeout;
     private int $maxMemory;
-    private bool $isolated;
+    private ?bool $isolated;
     private int $priority;
     private string $jobId;
     private int $defaultTimeout;
@@ -59,9 +59,11 @@ class LaravelJobAdapter implements KQueueJobInterface
             $command = $this->resolveCommand($payload);
 
             if ($command) {
-                // Check for isolated property
-                if (property_exists($command, 'isolated')) {
+                // Check for isolated property — preserve null so JobAnalyzer can auto-detect
+                if (property_exists($command, 'isolated') && $command->isolated !== null) {
                     $this->isolated = (bool) $command->isolated;
+                } elseif (property_exists($command, 'isolated') && $command->isolated === null) {
+                    $this->isolated = null; // null = let JobAnalyzer decide via code analysis
                 } else {
                     $this->isolated = $this->defaultIsolated;
                 }
@@ -274,7 +276,7 @@ class LaravelJobAdapter implements KQueueJobInterface
         return $this->maxMemory;
     }
 
-    public function isIsolated(): bool
+    public function isIsolated(): ?bool
     {
         return $this->isolated;
     }

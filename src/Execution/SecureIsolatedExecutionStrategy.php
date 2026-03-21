@@ -4,94 +4,75 @@ namespace KQueue\Execution;
 
 use KQueue\Contracts\ExecutionStrategy;
 use KQueue\Contracts\KQueueJobInterface;
-use React\ChildProcess\Process;
-use React\EventLoop\Loop;
-use React\EventLoop\LoopInterface;
-use React\Promise\PromiseInterface;
-use React\Promise\Deferred;
+use KQueue\Queue\LaravelJobAdapter;
 
 /**
- * SECURE Isolated Execution Strategy
- * Fixes critical security vulnerabilities:
- * - No unsafe deserialization
- * - Path validation
- * - Proper timeout enforcement
- * - Memory limit enforcement
- * - Secure temp file handling
+ * Secure isolated execution for non-Laravel KQueueJob classes.
+ *
+ * Validates the job class file is within allowed paths before spawning a
+ * child process. Uses JSON serialization instead of PHP serialize() to
+ * prevent object injection attacks.
+ *
+ * The coroutine suspends non-blocking while the child process runs —
+ * other jobs keep running concurrently. Server-side timeout and memory
+ * limits are enforced and cannot be exceeded by jobs.
  */
 class SecureIsolatedExecutionStrategy implements ExecutionStrategy
 {
-    private LoopInterface $loop;
     private array $allowedJobPaths;
-    private int $maxTimeout;
-    private int $maxMemory;
+    private int   $maxTimeout;
+    private int   $maxMemory;
 
     public function __construct(
-        ?LoopInterface $loop = null,
         array $allowedJobPaths = [],
-        int $maxTimeout = 300,      // 5 minutes max
-        int $maxMemory = 512        // 512MB max
+        int $maxTimeout = 300,
+        int $maxMemory = 512
     ) {
-        $this->loop = $loop ?? Loop::get();
         $this->allowedJobPaths = $allowedJobPaths;
-        $this->maxTimeout = $maxTimeout;
-        $this->maxMemory = $maxMemory;
+        $this->maxTimeout      = $maxTimeout;
+        $this->maxMemory       = $maxMemory;
     }
 
     public function canHandle(KQueueJobInterface $job): bool
     {
-        return $job->isIsolated();
+        return $job->isIsolated() !== false && !($job instanceof LaravelJobAdapter);
     }
 
-    public function execute(KQueueJobInterface $job): PromiseInterface
+    public function execute(KQueueJobInterface $job): void
     {
-        $deferred = new Deferred();
+        $this->validateJobProperties($job);
+        $this->validateJobClassPath($job);
 
-        try {
-            // SECURITY: Validate job properties server-side
-            $this->validateJobProperties($job);
+        $timeout = min($job->getTimeout(), $this->maxTimeout);
+        $tmpFile = $this->createJobScript($job);
 
-            // SECURITY: Validate job class file path
-            $jobClass = get_class($job);
-            $reflection = new \ReflectionClass($jobClass);
-            $jobClassFile = $reflection->getFileName();
+        // Coroutine suspends here — non-blocking wait
+        $result = \Swoole\Coroutine\System::exec(
+            sprintf('timeout %d php %s 2>&1', $timeout, escapeshellarg($tmpFile))
+        );
 
-            if (!$this->isPathAllowed($jobClassFile)) {
-                throw new \SecurityException(
-                    "Job class file is not in allowed directory: {$jobClassFile}"
-                );
-            }
+        @unlink($tmpFile);
 
-            // SECURITY: Use JSON instead of serialize() to prevent object injection
-            $jobData = $this->serializeJobSecurely($job);
-
-            // Create secure temporary file
-            $tmpFile = $this->createSecureTempFile($jobClass, $jobClassFile, $jobData, $job);
-
-            // Execute with timeout enforcement
-            $this->executeWithTimeout($tmpFile, $job, $deferred);
-
-        } catch (\Throwable $e) {
-            $deferred->reject($e);
+        if ($result['code'] === 124) {
+            throw new \RuntimeException("Job timed out after {$timeout} seconds and was killed");
         }
 
-        return $deferred->promise();
+        if ($result['code'] !== 0) {
+            // Sanitize error — no stack traces to external callers
+            throw new \RuntimeException("Job execution failed with exit code {$result['code']}");
+        }
     }
 
-    /**
-     * SECURITY: Validate job properties to prevent DoS
-     */
     private function validateJobProperties(KQueueJobInterface $job): void
     {
         $timeout = $job->getTimeout();
-        $memory = $job->getMaxMemory();
-
         if ($timeout <= 0 || $timeout > $this->maxTimeout) {
             throw new \InvalidArgumentException(
                 "Job timeout must be between 1 and {$this->maxTimeout} seconds, got: {$timeout}"
             );
         }
 
+        $memory = $job->getMaxMemory();
         if ($memory <= 0 || $memory > $this->maxMemory) {
             throw new \InvalidArgumentException(
                 "Job memory must be between 1 and {$this->maxMemory} MB, got: {$memory}"
@@ -99,127 +80,61 @@ class SecureIsolatedExecutionStrategy implements ExecutionStrategy
         }
     }
 
-    /**
-     * SECURITY: Validate that file path is in allowed directories
-     */
-    private function isPathAllowed(string $path): bool
+    private function validateJobClassPath(KQueueJobInterface $job): void
     {
-        // If no allowed paths configured, allow anything (development mode)
         if (empty($this->allowedJobPaths)) {
-            return true;
+            return; // No restriction — development mode
         }
 
-        $realPath = realpath($path);
-
-        if ($realPath === false) {
-            return false;
-        }
+        $reflection = new \ReflectionClass($job);
+        $jobFile    = realpath($reflection->getFileName());
 
         foreach ($this->allowedJobPaths as $allowedDir) {
-            $realAllowedDir = realpath($allowedDir);
-
-            if ($realAllowedDir !== false && str_starts_with($realPath, $realAllowedDir)) {
-                return true;
+            $resolved = realpath($allowedDir);
+            if ($resolved && str_starts_with($jobFile, $resolved)) {
+                return;
             }
         }
 
-        return false;
+        throw new \RuntimeException(
+            sprintf('Job class file is outside allowed paths: %s', $jobFile)
+        );
     }
 
-    /**
-     * SECURITY: Use JSON instead of serialize() to prevent object injection
-     */
-    private function serializeJobSecurely(KQueueJobInterface $job): string
+    private function createJobScript(KQueueJobInterface $job): string
     {
-        // Extract only serializable data (no objects)
-        $jobData = [
-            'class' => get_class($job),
-            'properties' => $this->extractJobProperties($job),
-            'timeout' => $job->getTimeout(),
-            'maxMemory' => $job->getMaxMemory(),
-        ];
-
-        return base64_encode(json_encode($jobData, JSON_THROW_ON_ERROR));
-    }
-
-    /**
-     * Extract public properties from job object (safe for JSON)
-     */
-    private function extractJobProperties(KQueueJobInterface $job): array
-    {
-        $reflection = new \ReflectionClass($job);
-        $properties = [];
-
-        foreach ($reflection->getProperties(\ReflectionProperty::IS_PUBLIC) as $property) {
-            $name = $property->getName();
-
-            // Skip internal properties
-            if (in_array($name, ['timeout', 'maxMemory', 'isolated', 'priority'])) {
-                continue;
-            }
-
-            $value = $property->getValue($job);
-
-            // Only serialize scalar values and arrays (no objects)
-            if (is_scalar($value) || is_array($value) || is_null($value)) {
-                $properties[$name] = $value;
-            }
-        }
-
-        return $properties;
-    }
-
-    /**
-     * SECURITY: Create temp file with proper permissions
-     */
-    private function createSecureTempFile(
-        string $jobClass,
-        string $jobClassFile,
-        string $jobData,
-        KQueueJobInterface $job
-    ): string {
-        $tmpFile = tempnam(sys_get_temp_dir(), 'kqueue_job_');
-
-        // SECURITY: Set restrictive permissions (owner read/write only)
+        $tmpFile = tempnam(sys_get_temp_dir(), 'kqueue_secure_job_');
         chmod($tmpFile, 0600);
 
+        $jobClass     = get_class($job);
+        $reflection   = new \ReflectionClass($jobClass);
+        $jobClassFile = $reflection->getFileName();
         $autoloadPath = dirname(__DIR__, 2) . '/vendor/autoload.php';
-        $memoryLimit = $job->getMaxMemory();
+        $memoryLimit  = min($job->getMaxMemory(), $this->maxMemory);
 
-        // SECURITY: Sanitize paths for script
-        $autoloadPath = addslashes($autoloadPath);
-        $jobClassFile = addslashes($jobClassFile);
-        $jobClass = addslashes($jobClass);
+        // Use JSON instead of serialize() to prevent object injection
+        $jobData = base64_encode(json_encode([
+            'class'      => $jobClass,
+            'properties' => $this->extractScalarProperties($job),
+        ], JSON_THROW_ON_ERROR));
 
-        // Create script that reconstructs job from JSON (safe)
         $script = <<<PHP
 <?php
-// SECURITY: Set memory limit
 ini_set('memory_limit', '{$memoryLimit}M');
-
 require_once '{$autoloadPath}';
 require_once '{$jobClassFile}';
-
-// SECURITY: Deserialize from JSON (not unserialize!)
-\$jobData = json_decode(base64_decode('{$jobData}'), true, 512, JSON_THROW_ON_ERROR);
-
-// Reconstruct job object
-\$jobClass = \$jobData['class'];
-\$job = new \$jobClass();
-
-// Set properties
-foreach (\$jobData['properties'] as \$name => \$value) {
-    if (property_exists(\$job, \$name)) {
-        \$job->\$name = \$value;
+\$data = json_decode(base64_decode('{$jobData}'), true, 512, JSON_THROW_ON_ERROR);
+\$job  = new \$data['class']();
+foreach (\$data['properties'] as \$prop => \$value) {
+    if (property_exists(\$job, \$prop)) {
+        \$job->\$prop = \$value;
     }
 }
-
 try {
     \$job->handle();
     exit(0);
 } catch (\Throwable \$e) {
-    // SECURITY: Don't leak stack traces
-    fwrite(STDERR, "Job failed: " . \$e->getMessage());
+    fwrite(STDERR, \$e->getMessage() . "\\n");
     exit(1);
 }
 PHP;
@@ -229,63 +144,24 @@ PHP;
         return $tmpFile;
     }
 
-    /**
-     * SECURITY: Execute with enforced timeout (actually kill the process)
-     */
-    private function executeWithTimeout(
-        string $tmpFile,
-        KQueueJobInterface $job,
-        Deferred $deferred
-    ): void {
-        $process = new Process('php ' . escapeshellarg($tmpFile));
-        $process->start($this->loop);
+    private function extractScalarProperties(KQueueJobInterface $job): array
+    {
+        $properties = [];
+        $reflection = new \ReflectionClass($job);
+        $skip       = ['timeout', 'maxMemory', 'isolated', 'priority'];
 
-        $stderr = '';
-        $timeoutTimer = null;
-        $isTimedOut = false;
-
-        // SECURITY: Actually enforce timeout by killing the process
-        $timeoutTimer = $this->loop->addTimer($job->getTimeout(), function() use ($process, &$isTimedOut) {
-            if ($process->isRunning()) {
-                $isTimedOut = true;
-                $process->terminate(SIGKILL); // Hard kill
-            }
-        });
-
-        $process->stdout->on('data', function($data) {
-            // Forward stdout but don't echo sensitive data
-            // In production, this should go to structured logs
-        });
-
-        $process->stderr->on('data', function($data) use (&$stderr) {
-            $stderr .= $data;
-        });
-
-        $process->on('exit', function($exitCode) use ($deferred, &$stderr, $tmpFile, $timeoutTimer, &$isTimedOut) {
-            // Cancel timeout timer
-            if ($timeoutTimer) {
-                $this->loop->cancelTimer($timeoutTimer);
+        foreach ($reflection->getProperties(\ReflectionProperty::IS_PUBLIC) as $prop) {
+            if (in_array($prop->getName(), $skip, true)) {
+                continue;
             }
 
-            // Clean up temp file securely
-            if (file_exists($tmpFile)) {
-                @unlink($tmpFile);
-            }
+            $value = $prop->getValue($job);
 
-            if ($isTimedOut) {
-                $deferred->reject(new \RuntimeException('Job execution timed out and was killed'));
-            } elseif ($exitCode === 0) {
-                $deferred->resolve(null);
-            } else {
-                // SECURITY: Sanitize error message
-                $error = 'Job execution failed with exit code ' . $exitCode;
-                $deferred->reject(new \RuntimeException($error));
+            if (is_scalar($value) || is_array($value) || is_null($value)) {
+                $properties[$prop->getName()] = $value;
             }
-        });
+        }
+
+        return $properties;
     }
 }
-
-/**
- * Custom Security Exception
- */
-class SecurityException extends \RuntimeException {}

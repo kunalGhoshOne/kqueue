@@ -4,16 +4,15 @@ namespace KQueue\Execution;
 
 use KQueue\Contracts\ExecutionStrategy;
 use KQueue\Contracts\KQueueJobInterface;
-use React\Promise\PromiseInterface;
-use React\Promise\Deferred;
 
 /**
- * SECURE Inline Execution Strategy
+ * Inline execution with server-side memory limit enforcement.
  *
- * Executes jobs inline within the event loop with security improvements:
- * - Memory limit enforcement
- * - Execution time limits
- * - Error sanitization
+ * Runs in the current Swoole coroutine. SWOOLE_HOOK_ALL makes all blocking
+ * I/O non-blocking automatically. Adds a memory cap so a single job cannot
+ * exhaust the process.
+ *
+ * Best for: I/O-bound jobs in production (emails, HTTP, DB queries, cache)
  */
 class SecureInlineExecutionStrategy implements ExecutionStrategy
 {
@@ -26,53 +25,23 @@ class SecureInlineExecutionStrategy implements ExecutionStrategy
 
     public function canHandle(KQueueJobInterface $job): bool
     {
-        // Handle non-isolated jobs
-        return !$job->isIsolated();
+        return $job->isIsolated() === false;
     }
 
-    public function execute(KQueueJobInterface $job): PromiseInterface
+    public function execute(KQueueJobInterface $job): void
     {
-        $deferred = new Deferred();
+        $jobMemoryLimit  = min($job->getMaxMemory(), $this->maxMemory);
+        $oldMemoryLimit  = ini_get('memory_limit');
+
+        ini_set('memory_limit', $jobMemoryLimit . 'M');
 
         try {
-            // SECURITY: Set memory limit for this execution
-            $oldMemoryLimit = ini_get('memory_limit');
-            $jobMemoryLimit = min($job->getMaxMemory(), $this->maxMemory);
-            ini_set('memory_limit', $jobMemoryLimit . 'M');
-
-            // SECURITY: Track start time for timeout
-            $startTime = microtime(true);
-            $timeout = $job->getTimeout();
-
-            // Execute the job
             $job->handle();
-
-            // SECURITY: Check if we exceeded timeout
-            $executionTime = microtime(true) - $startTime;
-            if ($executionTime > $timeout) {
-                error_log(sprintf(
-                    "[KQueue] Warning: Job completed but exceeded timeout (%.2fs > %ds)",
-                    $executionTime,
-                    $timeout
-                ));
-            }
-
-            // Restore memory limit
-            ini_set('memory_limit', $oldMemoryLimit);
-
-            // Resolve successfully
-            $deferred->resolve(null);
-
         } catch (\Throwable $e) {
-            // SECURITY: Sanitize error (no stack traces to user)
-            error_log(sprintf(
-                "[KQueue] Job execution failed: %s",
-                $e->getMessage()
-            ));
-
-            $deferred->reject($e);
+            error_log(sprintf('[KQueue] Inline job failed: %s', $e->getMessage()));
+            throw $e;
+        } finally {
+            ini_set('memory_limit', $oldMemoryLimit);
         }
-
-        return $deferred->promise();
     }
 }

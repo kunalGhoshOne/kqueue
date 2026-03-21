@@ -4,39 +4,28 @@ namespace KQueue\Execution;
 
 use KQueue\Contracts\ExecutionStrategy;
 use KQueue\Contracts\KQueueJobInterface;
-use React\Promise\PromiseInterface;
-use React\Promise\Deferred;
 
 /**
- * Executes jobs inline within the event loop (SEQUENTIAL)
+ * Runs the job in the current Swoole coroutine.
  *
- * This is an OPT-IN strategy for lightweight jobs that don't need concurrency.
- * Jobs must explicitly set: public bool $isolated = false;
+ * Because SWOOLE_HOOK_ALL is enabled at worker startup, every blocking call
+ * inside the job — sleep(), DB queries, HTTP requests, file I/O, Redis — is
+ * automatically non-blocking. Thousands of jobs can run concurrently on a
+ * single thread with zero changes to job code.
  *
- * Best for: Fast I/O operations, HTTP requests, database queries
+ * Best for: I/O-bound jobs (emails, HTTP calls, DB queries, cache, notifications)
+ *
+ * To opt in explicitly: public ?bool $isolated = false;
  */
 class InlineExecutionStrategy implements ExecutionStrategy
 {
     public function canHandle(KQueueJobInterface $job): bool
     {
-        // Only handle jobs that explicitly opt-out of isolation
         return $job->isIsolated() === false;
     }
 
-    public function execute(KQueueJobInterface $job): PromiseInterface
+    public function execute(KQueueJobInterface $job): void
     {
-        $deferred = new Deferred();
-
-        try {
-            // Execute the job
-            $job->handle();
-
-            // Resolve immediately (synchronous execution)
-            $deferred->resolve(null);
-        } catch (\Throwable $e) {
-            $deferred->reject($e);
-        }
-
-        return $deferred->promise();
+        $job->handle();
     }
 }
