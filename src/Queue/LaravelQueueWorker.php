@@ -13,37 +13,41 @@ use Illuminate\Queue\Events\WorkerStopping;
 use KQueue\Runtime\KQueueRuntime;
 use KQueue\Runtime\SecureKQueueRuntime;
 use KQueue\Runtime\SmartKQueueRuntime;
-use React\EventLoop\LoopInterface;
-use React\EventLoop\TimerInterface;
 use Illuminate\Support\Facades\Log;
 
 /**
- * Laravel Queue Worker for KQueue
+ * Laravel queue worker for KQueue.
  *
- * Polls Laravel queues and dispatches jobs to KQueue runtime for execution.
- * Uses timer-based polling to avoid blocking the event loop.
+ * Boots Swoole's coroutine runtime, enables SWOOLE_HOOK_ALL so all blocking
+ * PHP calls become non-blocking, then polls the queue using a Swoole timer.
+ * Each job is dispatched to the KQueue runtime which spawns a coroutine —
+ * no code changes required in existing Laravel jobs.
+ *
+ * Fixes all Swoole pitfalls automatically via SwooleStateManager:
+ *  - Global state reset per job
+ *  - Singleton flush per job
+ *  - Non-hookable extension detection at startup
+ *  - Coroutine context always guaranteed
  */
 class LaravelQueueWorker
 {
     private KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime $runtime;
-    private QueueManager $queueManager;
-    private ?Dispatcher $events;
-    private LoopInterface $loop;
+    private QueueManager  $queueManager;
+    private ?Dispatcher   $events;
 
     private string $connection;
     private string $queue;
-    private int $sleep; // milliseconds
-    private int $maxJobs;
-    private int $maxTime; // seconds
-    private int $defaultTimeout;
-    private int $defaultMemory;
-    private bool $defaultIsolated;
+    private int    $sleep;     // milliseconds
+    private int    $maxJobs;
+    private int    $maxTime;   // seconds
+    private int    $defaultTimeout;
+    private int    $defaultMemory;
+    private bool   $defaultIsolated;
 
-    private int $jobsProcessed = 0;
-    private float $startTime;
-    private bool $shouldQuit = false;
-    private ?TimerInterface $pollTimer = null;
-    private array $stopCallbacks = [];
+    private int    $jobsProcessed = 0;
+    private float  $startTime;
+    private bool   $shouldQuit   = false;
+    private ?int   $pollTimerId  = null;
 
     public function __construct(
         KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime $runtime,
@@ -51,126 +55,93 @@ class LaravelQueueWorker
         ?Dispatcher $events = null,
         array $options = []
     ) {
-        $this->runtime = $runtime;
+        $this->runtime      = $runtime;
         $this->queueManager = $queueManager;
-        $this->events = $events;
-        $this->loop = $runtime->getLoop();
+        $this->events       = $events;
 
-        // Worker options
-        $this->connection = $options['connection'] ?? 'redis';
-        $this->queue = $options['queue'] ?? 'default';
-        $this->sleep = $options['sleep'] ?? 100; // 100ms default
-        $this->maxJobs = $options['maxJobs'] ?? 0;
-        $this->maxTime = $options['maxTime'] ?? 0;
-
-        // Job defaults
-        $this->defaultTimeout = $options['defaultTimeout'] ?? 60;
-        $this->defaultMemory = $options['defaultMemory'] ?? 128;
-        $this->defaultIsolated = $options['defaultIsolated'] ?? true; // Isolated by default for concurrency!
+        $this->connection      = $options['connection']      ?? 'redis';
+        $this->queue           = $options['queue']           ?? 'default';
+        $this->sleep           = $options['sleep']           ?? 100;
+        $this->maxJobs         = $options['maxJobs']         ?? 0;
+        $this->maxTime         = $options['maxTime']         ?? 0;
+        $this->defaultTimeout  = $options['defaultTimeout']  ?? 60;
+        $this->defaultMemory   = $options['defaultMemory']   ?? 128;
+        $this->defaultIsolated = $options['defaultIsolated'] ?? true;
 
         $this->startTime = microtime(true);
     }
 
     /**
-     * Start the worker loop
+     * Start the worker.
+     *
+     * Enables SWOOLE_HOOK_ALL then enters Swoole\Coroutine\run() — a long-lived
+     * coroutine context where all I/O is non-blocking. This call blocks until
+     * the worker is stopped (via stop() or a signal).
      */
     public function work(): void
     {
-        // Register signal handlers for graceful shutdown
-        $this->registerStopListener();
+        // Issue 4 fix: ensure we are always inside a coroutine context.
+        // SWOOLE_HOOK_ALL makes sleep/DB/HTTP/file non-blocking everywhere.
+        \Swoole\Runtime::enableCoroutine(SWOOLE_HOOK_ALL);
 
-        // Start polling
-        $this->schedulePoll();
+        \Swoole\Coroutine\run(function () {
+            $this->registerSignalHandlers();
+            $this->runtime->start();
 
-        Log::info('KQueue worker started', [
-            'connection' => $this->connection,
-            'queue' => $this->queue,
-            'sleep' => $this->sleep . 'ms',
-            'maxJobs' => $this->maxJobs ?: 'unlimited',
-            'maxTime' => $this->maxTime ? $this->maxTime . 's' : 'unlimited',
-        ]);
+            Log::info('KQueue worker started', [
+                'connection' => $this->connection,
+                'queue'      => $this->queue,
+                'sleep'      => $this->sleep . 'ms',
+                'maxJobs'    => $this->maxJobs  ?: 'unlimited',
+                'maxTime'    => $this->maxTime  ? $this->maxTime . 's' : 'unlimited',
+            ]);
 
-        // Start the event loop (blocks until stopped)
-        $this->runtime->start();
+            $this->pollTimerId = \Swoole\Timer::tick($this->sleep, function () {
+                if (!$this->shouldContinue()) {
+                    $this->stop();
+                    return;
+                }
+
+                $this->poll();
+            });
+        });
 
         Log::info('KQueue worker stopped', [
             'jobs_processed' => $this->jobsProcessed,
-            'runtime' => round(microtime(true) - $this->startTime, 2) . 's',
+            'runtime'        => round(microtime(true) - $this->startTime, 2) . 's',
         ]);
     }
 
-    /**
-     * Schedule next poll iteration
-     *
-     * @param bool $immediate If true, poll immediately without delay
-     */
-    private function schedulePoll(bool $immediate = false): void
-    {
-        if ($this->shouldQuit) {
-            return;
-        }
-
-        $delay = $immediate ? 0 : ($this->sleep / 1000); // Convert ms to seconds
-
-        $this->pollTimer = $this->loop->addTimer($delay, function () {
-            $this->poll();
-        });
-    }
-
-    /**
-     * Single poll iteration
-     * Checks queue for jobs and processes them
-     */
     private function poll(): void
     {
-        // Check if should continue
-        if (!$this->shouldContinue()) {
-            $this->stop();
-            return;
-        }
-
-        // Raise looping event
         $this->raiseEvent(new Looping($this->connection, $this->queue));
 
         try {
-            // Get queue connection
             $queueConnection = $this->queueManager->connection($this->connection);
-
-            // Pop next job from queue
-            $laravelJob = $queueConnection->pop($this->queue);
+            $laravelJob      = $queueConnection->pop($this->queue);
 
             if ($laravelJob instanceof Job) {
-                // Process the job
                 $this->processJob($laravelJob);
-
-                // Schedule immediate next poll (more jobs might be available)
-                $this->schedulePoll(true);
-            } else {
-                // No jobs available, schedule next poll with delay
-                $this->schedulePoll(false);
             }
         } catch (\Throwable $e) {
-            Log::error('Error during poll', [
-                'connection' => $this->connection,
-                'queue' => $this->queue,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
+            // Ignore "connection closed" errors that occur when the worker stops
+            if (str_contains($e->getMessage(), 'connection is closed')
+                || str_contains($e->getMessage(), 'socket was already closed')
+                || $this->shouldQuit) {
+                return;
+            }
 
-            // Continue polling despite error
-            $this->schedulePoll(false);
+            Log::error('Error during queue poll', [
+                'connection' => $this->connection,
+                'queue'      => $this->queue,
+                'error'      => $e->getMessage(),
+            ]);
         }
     }
 
-    /**
-     * Process a single job
-     *
-     * @param Job $laravelJob The Laravel job to process
-     */
     private function processJob(Job $laravelJob): void
     {
         try {
-            // Wrap Laravel job in adapter
             $adapter = new LaravelJobAdapter(
                 $laravelJob,
                 $this->defaultTimeout,
@@ -178,117 +149,62 @@ class LaravelQueueWorker
                 $this->defaultIsolated
             );
 
-            // Raise job processing event
             $this->raiseEvent(new JobProcessing($this->connection, $laravelJob));
 
-            Log::debug('Processing job', [
-                'job_id' => $adapter->getJobId(),
+            Log::debug('Dispatching job to KQueue runtime', [
+                'job_id'   => $adapter->getJobId(),
                 'job_name' => $laravelJob->getName(),
-                'attempt' => $adapter->getAttempts(),
-                'queue' => $this->queue,
+                'attempt'  => $adapter->getAttempts(),
             ]);
 
-            // Execute job via KQueue runtime
-            $promise = $this->runtime->executeJob($adapter);
-
-            // Handle successful execution
-            $promise->then(
+            // Spawn coroutine — returns immediately, job runs concurrently
+            $this->runtime->executeJob(
+                $adapter,
                 function () use ($adapter, $laravelJob) {
                     $adapter->onSuccess();
                     $this->jobsProcessed++;
-
-                    // Raise job processed event
                     $this->raiseEvent(new JobProcessed($this->connection, $laravelJob));
-
-                    Log::info('Job completed', [
-                        'job_id' => $adapter->getJobId(),
-                        'jobs_processed' => $this->jobsProcessed,
-                    ]);
+                    Log::info('Job completed', ['job_id' => $adapter->getJobId()]);
                 },
-                function (\Throwable $exception) use ($adapter, $laravelJob) {
-                    $adapter->onFailure($exception);
-
-                    // Raise job failed event
-                    $this->raiseEvent(new JobFailed($this->connection, $laravelJob, $exception));
-
+                function (\Throwable $e) use ($adapter, $laravelJob) {
+                    $adapter->onFailure($e);
+                    $this->raiseEvent(new JobFailed($this->connection, $laravelJob, $e));
                     Log::error('Job failed', [
                         'job_id' => $adapter->getJobId(),
-                        'error' => $exception->getMessage(),
-                        'attempt' => $adapter->getAttempts(),
+                        'error'  => $e->getMessage(),
                     ]);
                 }
             );
         } catch (\Throwable $e) {
-            // Handle errors in job processing setup
             Log::error('Error setting up job', [
-                'job_id' => $laravelJob->getJobId(),
                 'error' => $e->getMessage(),
             ]);
 
-            // Release job back to queue
             if (!$laravelJob->isDeleted() && !$laravelJob->isReleased()) {
                 $laravelJob->release(60);
             }
         }
     }
 
-    /**
-     * Check if worker should continue processing
-     */
     private function shouldContinue(): bool
     {
-        // Check quit flag
         if ($this->shouldQuit) {
             return false;
         }
 
-        // Check max jobs limit
         if ($this->maxJobs > 0 && $this->jobsProcessed >= $this->maxJobs) {
-            Log::info('Max jobs limit reached', [
-                'jobs_processed' => $this->jobsProcessed,
-                'max_jobs' => $this->maxJobs,
-            ]);
+            Log::info('Max jobs limit reached', ['jobs_processed' => $this->jobsProcessed]);
             return false;
         }
 
-        // Check max time limit
-        if ($this->maxTime > 0) {
-            $elapsed = microtime(true) - $this->startTime;
-            if ($elapsed >= $this->maxTime) {
-                Log::info('Max time limit reached', [
-                    'elapsed' => round($elapsed, 2) . 's',
-                    'max_time' => $this->maxTime . 's',
-                ]);
-                return false;
-            }
+        if ($this->maxTime > 0 && (microtime(true) - $this->startTime) >= $this->maxTime) {
+            Log::info('Max time limit reached', ['elapsed' => round(microtime(true) - $this->startTime, 2) . 's']);
+            return false;
         }
 
         return true;
     }
 
-    /**
-     * Register signal handlers for graceful shutdown
-     */
-    private function registerStopListener(): void
-    {
-        if (extension_loaded('pcntl')) {
-            pcntl_async_signals(true);
-
-            pcntl_signal(SIGTERM, function () {
-                Log::info('Received SIGTERM, stopping worker gracefully');
-                $this->stop();
-            });
-
-            pcntl_signal(SIGINT, function () {
-                Log::info('Received SIGINT, stopping worker gracefully');
-                $this->stop();
-            });
-        }
-    }
-
-    /**
-     * Stop the worker gracefully
-     */
     public function stop(): void
     {
         if ($this->shouldQuit) {
@@ -297,68 +213,56 @@ class LaravelQueueWorker
 
         $this->shouldQuit = true;
 
-        // Cancel pending poll timer
-        if ($this->pollTimer !== null) {
-            $this->loop->cancelTimer($this->pollTimer);
-            $this->pollTimer = null;
+        if ($this->pollTimerId !== null) {
+            \Swoole\Timer::clear($this->pollTimerId);
+            $this->pollTimerId = null;
         }
 
-        // Raise worker stopping event
         $this->raiseEvent(new WorkerStopping());
-
-        // Execute stop callbacks
-        foreach ($this->stopCallbacks as $callback) {
-            try {
-                $callback();
-            } catch (\Throwable $e) {
-                Log::error('Error in stop callback', [
-                    'error' => $e->getMessage(),
-                ]);
-            }
-        }
-
-        // Stop the runtime
         $this->runtime->stop();
     }
 
     /**
-     * Register a callback to be executed when worker stops
+     * Use Swoole\Process::signal() for coroutine-safe signal handling.
+     * pcntl_signal() is not safe inside Swoole coroutines.
      */
-    public function onStop(callable $callback): void
+    private function registerSignalHandlers(): void
     {
-        $this->stopCallbacks[] = $callback;
+        \Swoole\Process::signal(SIGTERM, function () {
+            Log::info('Received SIGTERM, stopping worker gracefully');
+            $this->stop();
+        });
+
+        \Swoole\Process::signal(SIGINT, function () {
+            Log::info('Received SIGINT, stopping worker gracefully');
+            $this->stop();
+        });
     }
 
-    /**
-     * Raise a worker event
-     *
-     * @param object $event The event to raise
-     */
     private function raiseEvent(object $event): void
     {
-        if ($this->events !== null) {
-            try {
-                $this->events->dispatch($event);
-            } catch (\Throwable $e) {
-                Log::error('Error dispatching event', [
-                    'event' => get_class($event),
-                    'error' => $e->getMessage(),
-                ]);
-            }
+        if ($this->events === null) {
+            return;
+        }
+
+        try {
+            $this->events->dispatch($event);
+        } catch (\Throwable $e) {
+            Log::error('Error dispatching event', [
+                'event' => get_class($event),
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
-    /**
-     * Get worker statistics
-     */
     public function getStats(): array
     {
         return [
-            'connection' => $this->connection,
-            'queue' => $this->queue,
+            'connection'     => $this->connection,
+            'queue'          => $this->queue,
             'jobs_processed' => $this->jobsProcessed,
-            'runtime' => round(microtime(true) - $this->startTime, 2),
-            'should_quit' => $this->shouldQuit,
+            'runtime'        => round(microtime(true) - $this->startTime, 2),
+            'should_quit'    => $this->shouldQuit,
         ];
     }
 }

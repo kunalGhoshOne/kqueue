@@ -15,138 +15,138 @@ use KQueue\Execution\SecureIsolatedExecutionStrategy;
 use KQueue\Execution\SecureLaravelIsolatedExecutionStrategy;
 use KQueue\Analysis\JobAnalyzer;
 use KQueue\Queue\LaravelQueueWorker;
+use KQueue\Swoole\SwooleStateManager;
 
 class KQueueWorkCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'kqueue:work
                             {connection? : The name of the queue connection to work}
                             {--queue=default : The name of the queue to work}
-                            {--sleep=100 : Number of milliseconds to sleep between polls}
-                            {--timeout=60 : The number of seconds a job can run before timing out}
-                            {--memory=512 : The memory limit in megabytes for the runtime}
-                            {--max-jobs=0 : The number of jobs to process before stopping (0 = unlimited)}
-                            {--max-time=0 : The maximum number of seconds to run (0 = unlimited)}
-                            {--inline : Force all jobs to run inline/sequential (opt-out of concurrency)}
-                            {--smart : Use smart runtime with automatic job analysis (RECOMMENDED)}
+                            {--sleep=100 : Milliseconds between queue polls}
+                            {--timeout=60 : Seconds a job can run before timing out}
+                            {--memory=512 : Runtime memory limit in megabytes}
+                            {--max-jobs=0 : Jobs to process before stopping (0 = unlimited)}
+                            {--max-time=0 : Seconds to run before stopping (0 = unlimited)}
+                            {--inline : Force all jobs to run inline (disables process isolation)}
+                            {--smart : Use smart runtime with automatic job analysis (default)}
                             {--secure : Use secure runtime with hardened security features}';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Start processing jobs from a Laravel queue using KQueue runtime';
+    protected $description = 'Start the KQueue worker — concurrent, non-blocking job processing powered by Swoole';
 
-    /**
-     * Execute the console command.
-     */
     public function handle(QueueManager $queueManager, Dispatcher $events): int
     {
+        // Check 1: Swoole must be installed
+        if (!extension_loaded('swoole')) {
+            $this->error('Swoole extension is not installed.');
+            $this->line('');
+            $this->line('Install it with one of:');
+            $this->line('  Ubuntu/Debian:  <comment>apt install php-swoole</comment>');
+            $this->line('  PECL:           <comment>pecl install swoole</comment>');
+            $this->line('  Docker:         <comment>RUN pecl install swoole && docker-php-ext-enable swoole</comment>');
+            $this->line('');
+
+            return 1;
+        }
+
+        // Check 2: Warn about non-hookable extensions
+        // Jobs using these are automatically routed to isolated processes
+        $nonHookable = SwooleStateManager::detectNonHookableExtensions();
+        if (!empty($nonHookable)) {
+            $this->warn('Non-hookable extensions detected: ' . implode(', ', $nonHookable));
+            $this->line('  Jobs using these extensions will be auto-routed to isolated processes.');
+            $this->line('');
+        }
+
         try {
-            // Get connection name (from argument, config, or default)
             $connection = $this->argument('connection')
                 ?? config('kqueue.default_connection')
                 ?? config('queue.default');
 
-            // Validate connection exists
             if (!$this->validateConnection($connection)) {
-                $this->error("Queue connection [{$connection}] is not configured.");
+                $this->error("Queue connection [{$connection}] is not configured in config/queue.php");
                 return 1;
             }
 
-            // Display startup information
             $this->displayStartupInfo($connection);
 
-            // Create runtime
-            $runtime = $this->createRuntime();
+            $stateManager = $this->buildStateManager();
+            $runtime      = $this->createRuntime($stateManager);
 
-            // Register execution strategies
             $this->registerStrategies($runtime);
 
-            // Create worker
-            $worker = $this->createWorker($runtime, $queueManager, $events);
+            $worker = $this->createWorker($runtime, $queueManager, $events, $connection);
 
-            // Register global error handler
-            $this->registerErrorHandler();
+            set_exception_handler(function (\Throwable $e) {
+                $this->error('Uncaught exception: ' . $e->getMessage());
+                exit(1);
+            });
 
-            // Start worker
             $worker->work();
 
             return 0;
         } catch (\Throwable $e) {
             $this->error('Failed to start worker: ' . $e->getMessage());
-            $this->line('');
             $this->line($e->getTraceAsString());
             return 1;
         }
     }
 
-    /**
-     * Validate queue connection configuration
-     */
-    private function validateConnection(string $connection): bool
+    private function buildStateManager(): SwooleStateManager
     {
-        $connections = config('queue.connections', []);
-        return isset($connections[$connection]);
+        $resettable = config('kqueue.swoole.resettable_singletons', []);
+
+        return new SwooleStateManager($resettable);
     }
 
-    /**
-     * Display startup information
-     */
+    private function validateConnection(string $connection): bool
+    {
+        return isset(config('queue.connections', [])[$connection]);
+    }
+
     private function displayStartupInfo(string $connection): void
     {
         $this->line('');
         $this->info('╔════════════════════════════════════════════════════════╗');
-        $this->info('║          KQueue Worker Starting                         ║');
+        $this->info('║           KQueue Worker  —  Powered by Swoole          ║');
         $this->info('╚════════════════════════════════════════════════════════╝');
         $this->line('');
-
         $this->line(sprintf('  <comment>Connection:</comment>  %s', $connection));
         $this->line(sprintf('  <comment>Queue:</comment>       %s', $this->option('queue')));
         $this->line(sprintf('  <comment>Sleep:</comment>       %dms', $this->option('sleep')));
         $this->line(sprintf('  <comment>Timeout:</comment>     %ds', $this->option('timeout')));
         $this->line(sprintf('  <comment>Memory:</comment>      %dMB', $this->option('memory')));
 
-        if ($this->option('max-jobs') > 0) {
+        if ((int) $this->option('max-jobs') > 0) {
             $this->line(sprintf('  <comment>Max Jobs:</comment>    %d', $this->option('max-jobs')));
         }
-
-        if ($this->option('max-time') > 0) {
+        if ((int) $this->option('max-time') > 0) {
             $this->line(sprintf('  <comment>Max Time:</comment>    %ds', $this->option('max-time')));
         }
 
         $useSmart = $this->option('smart') || config('kqueue.runtime.smart', true);
-        $runtime = $useSmart ? 'Smart (Auto-detect)' : ($this->option('secure') ? 'Secure' : 'Standard');
+        $runtime  = $useSmart ? 'Smart (auto-detect)' : ($this->option('secure') ? 'Secure' : 'Standard');
         $this->line(sprintf('  <comment>Runtime:</comment>     %s', $runtime));
 
-        if ($useSmart) {
-            $this->line('  <comment>Mode:</comment>        <fg=cyan>🧠 Smart Analysis Enabled (Auto-select strategy)</>');
-        } elseif ($this->option('inline')) {
-            $this->line('  <comment>Mode:</comment>        <fg=yellow>Sequential (inline) - concurrency disabled</>');
+        if ($this->option('inline')) {
+            $this->line('  <comment>Mode:</comment>        Sequential (inline) — process isolation disabled');
         } else {
-            $this->line('  <comment>Mode:</comment>        <fg=green>Concurrent (isolated by default)</>');
+            $this->line('  <comment>Mode:</comment>        Concurrent — jobs run as Swoole coroutines');
         }
 
         $this->line('');
-        $this->info('Press Ctrl+C to stop worker gracefully');
+        $this->line('  <info>SWOOLE_HOOK_ALL enabled</info> — sleep(), DB, HTTP, file I/O are non-blocking');
+        $this->line('  <info>State isolation enabled</info> — globals and singletons reset per job');
+        $this->line('');
+        $this->line('Press Ctrl+C to stop gracefully');
         $this->line('');
     }
 
-    /**
-     * Create KQueue runtime
-     */
-    private function createRuntime(): KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime
+    private function createRuntime(SwooleStateManager $stateManager): KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime
     {
         $memoryLimit = (int) $this->option('memory');
-        $useSmart = $this->option('smart') || config('kqueue.runtime.smart', true);
-        $useSecure = $this->option('secure') || config('kqueue.runtime.secure', true);
+        $useSmart    = $this->option('smart') || config('kqueue.runtime.smart', true);
+        $useSecure   = $this->option('secure') || config('kqueue.runtime.secure', true);
 
-        // Smart runtime with automatic strategy selection (BEST OPTION!)
         if ($useSmart) {
             $analyzer = new JobAnalyzer(
                 inlineThreshold: config('kqueue.analysis.inline_threshold', 1.0),
@@ -154,134 +154,83 @@ class KQueueWorkCommand extends Command
             );
 
             return new SmartKQueueRuntime(
-                loop: null,
                 strategySelector: null,
                 analyzer: $analyzer,
-                memoryLimitMB: $memoryLimit
+                memoryLimitMB: $memoryLimit,
+                stateManager: $stateManager
             );
         }
 
-        // Secure runtime (manual strategy selection)
         if ($useSecure) {
-            $maxTimeout = config('kqueue.jobs.max_timeout', 300);
-            $maxMemory = config('kqueue.jobs.max_memory', 512);
-            $maxConcurrent = config('kqueue.jobs.max_concurrent', 100);
-
             return new SecureKQueueRuntime(
-                null,
-                $memoryLimit,
-                $maxTimeout,
-                $maxMemory,
-                $maxConcurrent
+                memoryLimitMB: $memoryLimit,
+                maxJobTimeout: config('kqueue.jobs.max_timeout', 300),
+                maxJobMemory: config('kqueue.jobs.max_memory', 512),
+                maxConcurrentJobs: config('kqueue.jobs.max_concurrent', 100),
+                stateManager: $stateManager
             );
         }
 
-        // Basic runtime (manual strategy selection)
-        return new KQueueRuntime(memoryLimitMB: $memoryLimit);
+        return new KQueueRuntime(
+            memoryLimitMB: $memoryLimit,
+            stateManager: $stateManager
+        );
     }
 
-    /**
-     * Register execution strategies
-     */
     private function registerStrategies(KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime $runtime): void
     {
-        $useSmart = $this->option('smart') || config('kqueue.runtime.smart', true);
+        $useSmart  = $this->option('smart') || config('kqueue.runtime.smart', true);
+        $useSecure = $this->option('secure') || config('kqueue.runtime.secure', true);
 
-        // Smart runtime uses strategy selector
         if ($useSmart && $runtime instanceof SmartKQueueRuntime) {
-            $selector = $runtime->getStrategySelector();
-            $loop = $runtime->getLoop();
-            $maxMemory = config('kqueue.jobs.max_memory', 512);
-            $maxTimeout = config('kqueue.jobs.max_timeout', 300);
+            $selector    = $runtime->getStrategySelector();
+            $maxMemory   = config('kqueue.jobs.max_memory', 512);
+            $maxTimeout  = config('kqueue.jobs.max_timeout', 300);
 
-            // Register strategies for each execution mode
             $selector->registerStrategy('inline', new SecureInlineExecutionStrategy($maxMemory));
-            $selector->registerStrategy('pooled', new IsolatedExecutionStrategy($loop)); // TODO: Add PooledExecutionStrategy
-            $selector->registerStrategy('isolated', new SecureLaravelIsolatedExecutionStrategy(
-                $loop,
-                $maxTimeout,
-                $maxMemory
-            ));
+            $selector->registerStrategy('pooled', new SecureLaravelIsolatedExecutionStrategy($maxTimeout, $maxMemory));
+            $selector->registerStrategy('isolated', new SecureLaravelIsolatedExecutionStrategy($maxTimeout, $maxMemory));
 
-            $this->line('<info>✓</info> Smart execution strategies registered (inline, pooled, isolated)');
+            $this->line('<info>✓</info> Smart execution strategies registered (inline coroutine, pooled, isolated process)');
             return;
         }
 
-        // Manual runtime (legacy)
-        $useSecure = $this->option('secure') || config('kqueue.runtime.secure', true);
-        $loop = $runtime->getLoop();
-
         if ($useSecure) {
-            // Secure strategies
-            $maxTimeout = config('kqueue.jobs.max_timeout', 300);
-            $maxMemory = config('kqueue.jobs.max_memory', 512);
-
-            // Register Laravel-specific isolated strategy FIRST (most specific)
-            $runtime->addStrategy(new SecureLaravelIsolatedExecutionStrategy(
-                $loop,
-                $maxTimeout,
-                $maxMemory
-            ));
-
-            // Then register generic isolated strategy (for non-Laravel jobs)
+            $maxTimeout   = config('kqueue.jobs.max_timeout', 300);
+            $maxMemory    = config('kqueue.jobs.max_memory', 512);
             $allowedPaths = config('kqueue.security.allowed_job_paths', []);
-            $runtime->addStrategy(new SecureIsolatedExecutionStrategy(
-                $loop,
-                $allowedPaths,
-                $maxTimeout,
-                $maxMemory
-            ));
 
-            // Finally register inline strategy (opt-in for lightweight jobs)
+            // Laravel jobs — most specific, registered first
+            $runtime->addStrategy(new SecureLaravelIsolatedExecutionStrategy($maxTimeout, $maxMemory));
+            // Generic KQueue jobs
+            $runtime->addStrategy(new SecureIsolatedExecutionStrategy($allowedPaths, $maxTimeout, $maxMemory));
+            // Opt-in inline
             $runtime->addStrategy(new SecureInlineExecutionStrategy($maxMemory));
         } else {
-            // Standard strategies
-            $runtime->addStrategy(new IsolatedExecutionStrategy($loop));
+            $runtime->addStrategy(new IsolatedExecutionStrategy());
             $runtime->addStrategy(new InlineExecutionStrategy());
         }
 
         $this->line('<info>✓</info> Execution strategies registered');
     }
 
-    /**
-     * Create Laravel queue worker
-     */
     private function createWorker(
         KQueueRuntime|SecureKQueueRuntime|SmartKQueueRuntime $runtime,
         QueueManager $queueManager,
-        Dispatcher $events
+        Dispatcher $events,
+        string $connection
     ): LaravelQueueWorker {
-        $connection = $this->argument('connection')
-            ?? config('kqueue.default_connection')
-            ?? config('queue.default');
-
-        $options = [
-            'connection' => $connection,
-            'queue' => $this->option('queue'),
-            'sleep' => (int) $this->option('sleep'),
-            'maxJobs' => (int) $this->option('max-jobs'),
-            'maxTime' => (int) $this->option('max-time'),
-            'defaultTimeout' => (int) $this->option('timeout'),
-            'defaultMemory' => config('kqueue.jobs.default_memory', 128),
+        return new LaravelQueueWorker($runtime, $queueManager, $events, [
+            'connection'      => $connection,
+            'queue'           => $this->option('queue'),
+            'sleep'           => (int) $this->option('sleep'),
+            'maxJobs'         => (int) $this->option('max-jobs'),
+            'maxTime'         => (int) $this->option('max-time'),
+            'defaultTimeout'  => (int) $this->option('timeout'),
+            'defaultMemory'   => config('kqueue.jobs.default_memory', 128),
             'defaultIsolated' => $this->option('inline')
-                ? false  // --inline flag forces sequential execution
-                : config('kqueue.jobs.isolated_by_default', true),  // Default to concurrent!
-        ];
-
-        return new LaravelQueueWorker($runtime, $queueManager, $events, $options);
-    }
-
-    /**
-     * Register global error handler
-     */
-    private function registerErrorHandler(): void
-    {
-        set_exception_handler(function (\Throwable $e) {
-            $this->error('Uncaught exception: ' . $e->getMessage());
-            $this->line($e->getTraceAsString());
-
-            // Exit with error code
-            exit(1);
-        });
+                ? false
+                : config('kqueue.jobs.isolated_by_default', true),
+        ]);
     }
 }
